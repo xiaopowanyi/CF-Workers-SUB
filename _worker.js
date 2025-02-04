@@ -109,8 +109,8 @@ export default {
 				订阅格式 = 'surge';
 			} else if (userAgent.includes('quantumult%20x') || (url.searchParams.has('quanx') && !userAgent.includes('subconverter'))) {
 				订阅格式 = 'quanx';
-			} else if (userAgent.includes('loon') || (url.searchParams.has('loon') && !userAgent.includes('subconverter'))) {
-				订阅格式 = 'loon';
+			//} else if (userAgent.includes('loon') || (url.searchParams.has('loon') && !userAgent.includes('subconverter'))) {
+			//	订阅格式 = 'loon';
 			}
 
 			let subConverterUrl;
@@ -123,7 +123,7 @@ export default {
 			else if (url.searchParams.has('singbox')) 追加UA = 'singbox';
 			else if (url.searchParams.has('surge')) 追加UA = 'surge';
 			else if (url.searchParams.has('quanx')) 追加UA = 'Quantumult%20X';
-			else if (url.searchParams.has('loon')) 追加UA = 'Loon';
+			//else if (url.searchParams.has('loon')) 追加UA = 'Loon';
 
 			const 请求订阅响应内容 = await getSUB(urls, request, 追加UA, userAgentHeader);
 			console.log(请求订阅响应内容);
@@ -186,8 +186,8 @@ export default {
 				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=surge&ver=4&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
 			} else if (订阅格式 == 'quanx') {
 				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=quanx&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&udp=true`;
-			} else if (订阅格式 == 'loon') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=loon&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false`;
+			//} else if (订阅格式 == 'loon') {
+			//	subConverterUrl = `${subProtocol}://${subConverter}/sub?target=loon&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false`;
 			}
 			//console.log(订阅转换URL);
 			try {
@@ -603,9 +603,6 @@ async function KV(request, env, txt = 'ADD.txt', guest) {
 					surge订阅地址:<br>
 					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/${mytoken}?surge','qrcode_4')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/${mytoken}?surge</a><br>
 					<div id="qrcode_4" style="margin: 10px 10px 10px 10px;"></div>
-					loon订阅地址:<br>
-					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/${mytoken}?loon','qrcode_5')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/${mytoken}?loon</a><br>
-					<div id="qrcode_5" style="margin: 10px 10px 10px 10px;"></div>
 					&nbsp;&nbsp;<strong><a href="javascript:void(0);" id="noticeToggle" onclick="toggleNotice()">查看访客订阅∨</a></strong><br>
 					<div id="noticeContent" class="notice-content" style="display: none;">
 						---------------------------------------------------------------<br>
@@ -627,9 +624,6 @@ async function KV(request, env, txt = 'ADD.txt', guest) {
 						surge订阅地址:<br>
 						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${guest}&surge','guest_4')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${guest}&surge</a><br>
 						<div id="guest_4" style="margin: 10px 10px 10px 10px;"></div>
-						loon订阅地址:<br>
-						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${guest}&loon','guest_5')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${guest}&loon</a><br>
-						<div id="guest_5" style="margin: 10px 10px 10px 10px;"></div>
 					</div>
 					---------------------------------------------------------------<br>
 					################################################################<br>
