@@ -421,3 +421,48 @@ custom_proxy_group=美国节点\`select\`(?i)(美|美国|US|纽约|波特兰|达
 
     assert.equal(detectedCycles.length, 0, `Detected circular loops in proxy-groups: ${JSON.stringify(detectedCycles)}`);
 });
+
+test('Web UI rendering and KV configuration persistence', async () => {
+    const kvStore = new Map();
+    const mockEnv = {
+        TOKEN: 'admintoken',
+        GUESTTOKEN: 'guesttoken',
+        KV: {
+            get: async (k) => kvStore.get(k) || null,
+            put: async (k, v) => kvStore.set(k, v),
+            delete: async (k) => kvStore.delete(k)
+        }
+    };
+
+    // 1. GET request from browser -> returns modernized HTML dashboard
+    const resGet = await worker.fetch(new Request('https://mysub.workers.dev/admintoken', {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' }
+    }), mockEnv);
+    assert.equal(resGet.status, 200);
+    assert.equal(resGet.headers.get('Content-Type'), 'text/html;charset=utf-8');
+    const html = await resGet.text();
+    assert.ok(html.includes('汇聚订阅中心'));
+    assert.ok(html.includes('admintoken'));
+    assert.ok(html.includes('guesttoken'));
+    assert.ok(html.includes('SUBCONFIG'));
+    assert.ok(html.includes('一键导入'));
+    assert.ok(html.includes('去重整理'));
+
+    // 2. POST request to save LINK.txt and CONFIG.txt
+    const savePayload = {
+        link: 'trojan://pwd1@1.1.1.1:443#Node1\ntrojan://pwd2@2.2.2.2:443#Node2',
+        subConfig: 'https://example.com/custom.ini'
+    };
+    const resPost = await worker.fetch(new Request('https://mysub.workers.dev/admintoken', {
+        method: 'POST',
+        headers: {
+            'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(savePayload)
+    }), mockEnv);
+    assert.equal(resPost.status, 200);
+    assert.equal(await resPost.text(), '保存成功');
+    assert.equal(kvStore.get('LINK.txt'), savePayload.link);
+    assert.equal(kvStore.get('CONFIG.txt'), savePayload.subConfig);
+});
