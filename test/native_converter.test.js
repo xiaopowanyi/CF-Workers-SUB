@@ -18,7 +18,8 @@ import worker, {
     extractRuleProviderName,
     matchRegex,
     parseCustomProxyGroup,
-    breakCycles
+    breakCycles,
+    applyGhProxy
 } from '../_worker.js';
 
 test('Extract rule provider name from URL and deduplicate', () => {
@@ -465,4 +466,88 @@ test('Web UI rendering and KV configuration persistence', async () => {
     assert.equal(await resPost.text(), '保存成功');
     assert.equal(kvStore.get('LINK.txt'), savePayload.link);
     assert.equal(kvStore.get('CONFIG.txt'), savePayload.subConfig);
+});
+
+test('applyGhProxy accelerates raw.githubusercontent.com URLs', () => {
+    const rawUrl = 'https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list';
+    const proxied = applyGhProxy(rawUrl);
+    assert.equal(proxied, 'https://ghproxy.net/https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list');
+
+    // Does not double proxy
+    assert.equal(applyGhProxy(proxied), proxied);
+
+    // Can be disabled with 'false' or 'off'
+    assert.equal(applyGhProxy(rawUrl, 'false'), rawUrl);
+    assert.equal(applyGhProxy(rawUrl, 'off'), rawUrl);
+
+    // Supports custom proxy prefix
+    assert.equal(applyGhProxy(rawUrl, 'https://gh-proxy.com'), 'https://gh-proxy.com/https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list');
+});
+
+test('generateClashConfig fixes: DIRECT moved to end of 节点选择, AI自动测速 filters empty groups, rule-providers accelerated', () => {
+    const myIniText = `
+[custom]
+ruleset=全球直连,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/direct.list
+ruleset=德国节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/de.list
+ruleset=香港节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/hk.list
+ruleset=新加坡节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/sg.list
+ruleset=美国节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/us.list
+ruleset=日本节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/jp.list
+ruleset=漏网之鱼,[]FINAL
+
+custom_proxy_group=节点选择\`select\`[]DIRECT\`.*
+custom_proxy_group=AI自动测速\`url-test\`[]美国节点\`[]香港节点\`[]日本节点\`[]新加坡节点\`http://www.gstatic.com/generate_204\`300
+custom_proxy_group=香港节点\`select\`(?i)(港|香港|HK|Hong Kong|🇭🇰|HongKong)
+custom_proxy_group=新加坡节点\`select\`(?i)(新|新加坡|SG|坡|狮城|🇸🇬|Singapore)
+custom_proxy_group=日本节点\`select\`(?i)(日|日本|JP|川日|东京|大阪|泉日|埼玉|沪日|深日|🇯🇵|Japan)
+custom_proxy_group=德国节点\`select\`(?i)(德|德国|法兰克福|DE|🇩🇪|Germany)
+custom_proxy_group=美国节点\`select\`(?i)(美|美国|US|纽约|波特兰|达拉斯|俄勒|凤凰城|费利蒙|硅谷|拉斯|洛杉|圣何塞|圣克拉|西雅|芝加|🇺🇸|United States)
+custom_proxy_group=全球直连\`select\`[]DIRECT\`[]节点选择
+custom_proxy_group=漏网之鱼\`select\`[]节点选择\`[]全球直连
+`;
+
+    const parsedSub = parseSubConfig(myIniText);
+    // User has US, DE, SG, HK nodes, but NO Japan node
+    const mockNodes = [
+        parseNode('trojan://p1@1.1.1.1:443#Silicloud-US-Trojan'),
+        parseNode('trojan://p2@2.2.2.2:443#Oracle-DE-Trojan'),
+        parseNode('trojan://p3@3.3.3.3:443#Oracle-SG-Trojan'),
+        parseNode('trojan://p5@5.5.5.5:443#HuaWei-HK-Trojan')
+    ];
+    const processedNodes = processNodes(mockNodes);
+    const clashYaml = generateClashConfig(processedNodes, 'MySub', parsedSub);
+
+    // 1. 验证 rule-providers 包含 ghproxy 加速链接
+    assert.ok(clashYaml.includes('url: "https://ghproxy.net/https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/direct.list"'));
+
+    // 2. 解析 proxy-groups
+    const pgSection = clashYaml.split('\nproxy-groups:\n')[1].split(/\n(?:rule-providers|rules):/)[0];
+    const groupMatches = [...pgSection.matchAll(/  - name:\s*"([^"]+)"\s*\n\s*type:\s*(\S+)[\s\S]*?proxies:\n([\s\S]*?)(?=\n  - name:|$)/g)];
+    const groups = new Map();
+
+    for (const m of groupMatches) {
+        const gName = m[1];
+        const proxyLines = m[3].split('\n').map(l => l.trim()).filter(l => l.startsWith('-'));
+        const proxies = proxyLines.map(l => {
+            const raw = l.slice(1).trim();
+            try { return JSON.parse(raw); } catch { return raw; }
+        });
+        groups.set(gName, { type: m[2], proxies });
+    }
+
+    // 验证 问题 1：节点选择 第一项绝不能是 DIRECT，应为 AI自动测速，DIRECT 在最后一位
+    const nodeSelect = groups.get('节点选择');
+    assert.ok(nodeSelect);
+    assert.equal(nodeSelect.proxies[0], 'AI自动测速', '节点选择第一项必须为测速组');
+    assert.notEqual(nodeSelect.proxies[0], 'DIRECT', '节点选择第一项绝不能是 DIRECT');
+    assert.equal(nodeSelect.proxies[nodeSelect.proxies.length - 1], 'DIRECT', 'DIRECT 应置于末尾备选');
+
+    // 验证 问题 2：AI自动测速 剔除了空分组“日本节点”，只保留具有真实节点的国家分组
+    const aiTest = groups.get('AI自动测速');
+    assert.ok(aiTest);
+    assert.ok(aiTest.proxies.includes('美国节点'));
+    assert.ok(aiTest.proxies.includes('香港节点'));
+    assert.ok(aiTest.proxies.includes('新加坡节点'));
+    assert.ok(!aiTest.proxies.includes('日本节点'), 'AI自动测速必须剔除只有 DIRECT 的空国家分组');
+    assert.ok(!aiTest.proxies.includes('DIRECT'), 'AI自动测速中不应包含 DIRECT');
 });

@@ -170,9 +170,14 @@ export default {
 
 		if (outputFormat === 'clash') {
 			responseHeaders["Content-Type"] = "text/yaml; charset=utf-8";
+			// 解析 GitHub 规则加速代理 (默认 https://ghproxy.net/)
+			let currentGhProxy = url.searchParams.get('ghproxy');
+			if (currentGhProxy === null || currentGhProxy === undefined) {
+				currentGhProxy = env.GH_PROXY || env.GHPROXY || 'https://ghproxy.net/';
+			}
 			// 根据当前选择或配置的 SUBCONFIG 解析规则与分组
-			const subConfigParsed = await loadSubConfig(currentSubConfig);
-			const clashYaml = generateClashConfig(allNodes, FileName, subConfigParsed);
+			const subConfigParsed = await loadSubConfig(currentSubConfig, currentGhProxy);
+			const clashYaml = generateClashConfig(allNodes, FileName, subConfigParsed, currentGhProxy);
 			return new Response(clashYaml, { headers: responseHeaders });
 		} else {
 			responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
@@ -960,7 +965,25 @@ export function parseSubConfig(iniText) {
 	return { rulesets, directRules, customGroups };
 }
 
-export async function loadSubConfig(url) {
+export function applyGhProxy(url, ghProxy = 'https://ghproxy.net/') {
+	if (!url || !ghProxy || ghProxy === 'false' || ghProxy === 'none' || ghProxy === 'off') {
+		return url;
+	}
+	let prefix = ghProxy.trim();
+	if (!prefix.endsWith('/')) prefix += '/';
+	if (url.startsWith(prefix) || url.includes('ghproxy') || url.includes('gh-proxy')) {
+		return url;
+	}
+	if (url.startsWith('https://raw.githubusercontent.com/') || url.startsWith('http://raw.githubusercontent.com/')) {
+		return `${prefix}${url}`;
+	}
+	if (url.startsWith('https://github.com/') && url.includes('/raw/')) {
+		return `${prefix}${url}`;
+	}
+	return url;
+}
+
+export async function loadSubConfig(url, ghProxy = 'https://ghproxy.net/') {
 	if (!url) return null;
 	const now = Date.now();
 	const cached = subConfigCache.get(url);
@@ -980,7 +1003,25 @@ export async function loadSubConfig(url) {
 			return parsed;
 		}
 	} catch (e) {
-		console.error('Fetch subConfig failed for:', url, e);
+		console.warn('Fetch subConfig directly failed for:', url, e.message);
+		// 备选尝试：通过 GitHub 加速代理拉取
+		try {
+			const proxiedUrl = applyGhProxy(url, ghProxy);
+			if (proxiedUrl !== url) {
+				const controller2 = new AbortController();
+				const timeout2 = setTimeout(() => controller2.abort(), 4000);
+				const res2 = await fetch(proxiedUrl, { signal: controller2.signal });
+				clearTimeout(timeout2);
+				if (res2.ok) {
+					const text2 = await res2.text();
+					const parsed2 = parseSubConfig(text2);
+					subConfigCache.set(url, { parsed: parsed2, time: now });
+					return parsed2;
+				}
+			}
+		} catch (e2) {
+			console.error('Fallback fetch subConfig via ghProxy failed:', e2.message);
+		}
 	}
 
 	return cached ? cached.parsed : null;
@@ -1264,7 +1305,7 @@ export function extractRuleProviderName(url, idx, seenNames) {
 	}
 }
 
-export function generateClashConfig(nodes, subName = 'CF-Workers-SUB', subConfigParsed = null) {
+export function generateClashConfig(nodes, subName = 'CF-Workers-SUB', subConfigParsed = null, ghProxy = 'https://ghproxy.net/') {
 	const proxyNames = nodes.map(n => n.name);
 
 	let yaml = `# ${subName} Clash / Mihomo Configuration
@@ -1377,7 +1418,7 @@ proxies:
 		}
 
 		// 1. 节点选择（绝不包含下游 regionGroups，防止形成相互循环引用）
-		const mainSelectProxies = ["♻️ 自动选择", "🔯 故障转移", "DIRECT", ...proxyNames];
+		const mainSelectProxies = ["♻️ 自动选择", "🔯 故障转移", ...proxyNames, "DIRECT"];
 		builtGroups.push({
 			name: "节点选择",
 			type: "select",
@@ -1445,6 +1486,77 @@ proxies:
 		});
 	}
 
+	const realNodeNames = new Set(nodes.map(n => n.name));
+	const groupMap = new Map(builtGroups.map(g => [g.name, g]));
+
+	function hasRealProxies(groupName, visited = new Set()) {
+		if (visited.has(groupName)) return false;
+		visited.add(groupName);
+		if (realNodeNames.has(groupName)) return true;
+		if (groupName === 'DIRECT' || groupName === 'REJECT') return false;
+		const g = groupMap.get(groupName);
+		if (!g) return false;
+		for (const p of g.proxies || []) {
+			if (realNodeNames.has(p)) return true;
+			if (p !== 'DIRECT' && p !== 'REJECT' && groupMap.has(p)) {
+				if (hasRealProxies(p, visited)) return true;
+			}
+		}
+		return false;
+	}
+
+	// 1. 过滤测速组（url-test / fallback / load-balance）中的空分组及 DIRECT/REJECT，避免测速偏向 DIRECT
+	for (const g of builtGroups) {
+		if (g.type === 'url-test' || g.type === 'fallback' || g.type === 'load-balance') {
+			const validProxies = (g.proxies || []).filter(p => {
+				if (p === 'DIRECT' || p === 'REJECT') return false;
+				if (groupMap.has(p)) return hasRealProxies(p);
+				return realNodeNames.has(p);
+			});
+			if (validProxies.length > 0) {
+				g.proxies = validProxies;
+			} else {
+				// 若所有子分组皆无真实节点，回退至全部可用节点
+				g.proxies = proxyNames.length > 0 ? [...proxyNames] : ['DIRECT'];
+			}
+		}
+	}
+
+	// 2. 优化节点选择与各策略组顺序：DIRECT 移至末尾，首位优先放入测速组或有效代理节点，杜绝首次加载断网
+	for (const g of builtGroups) {
+		if (g.name === '节点选择') {
+			let proxies = [...(g.proxies || [])];
+			// 查找首选测速组（如 AI自动测速、♻️ 自动选择）
+			let autoTestGroup = null;
+			for (const cand of ['AI自动测速', '♻️ 自动选择']) {
+				if (groupMap.has(cand) && hasRealProxies(cand)) {
+					autoTestGroup = cand;
+					break;
+				}
+			}
+
+			const nonDirect = proxies.filter(p => p !== 'DIRECT' && p !== 'REJECT');
+			const directItems = proxies.filter(p => p === 'DIRECT' || p === 'REJECT');
+
+			if (autoTestGroup) {
+				const filteredNonDirect = nonDirect.filter(p => p !== autoTestGroup);
+				proxies = [autoTestGroup, ...filteredNonDirect, ...directItems];
+			} else {
+				proxies = [...nonDirect, ...directItems];
+			}
+
+			if (proxies.length === 0) proxies.push('DIRECT');
+			g.proxies = Array.from(new Set(proxies));
+		} else if (g.type === 'select' && g.name !== '全球直连' && g.name !== '全球拦截' && g.name !== '应用净化') {
+			const hasReal = g.proxies.some(p => realNodeNames.has(p) || (groupMap.has(p) && hasRealProxies(p)));
+			if (hasReal && g.proxies.includes('DIRECT')) {
+				const rest = g.proxies.filter(p => p !== 'DIRECT' && p !== 'REJECT');
+				const tail = g.proxies.filter(p => p === 'DIRECT' || p === 'REJECT');
+				g.proxies = [...rest, ...tail];
+			}
+		}
+	}
+
 	// 最终防环检查：破除任何潜在的循环引用（有向图拓扑无环化）
 	breakCycles(builtGroups);
 
@@ -1452,12 +1564,12 @@ proxies:
 	yaml += `\nproxy-groups:\n`;
 	yaml += builtGroups.map(formatProxyGroupYaml).join('\n\n') + '\n';
 
-	// 5. Rule-providers (根据 rule 文件名命名)
+	// 5. Rule-providers (根据 rule 文件名命名，并支持 GitHub 镜像加速)
 	const seenProviderNames = new Set();
 	const providerEntries = rulesets.map((r, idx) => ({
 		name: extractRuleProviderName(r.url, idx, seenProviderNames),
 		group: r.group,
-		url: r.url,
+		url: applyGhProxy(r.url, ghProxy),
 		interval: r.interval || 86400
 	}));
 
