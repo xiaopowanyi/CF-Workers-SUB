@@ -188,12 +188,13 @@ export default {
 				//"Subscription-Userinfo": `upload=${UD}; download=${UD}; total=${total}; expire=${expire}`,
 			};
 
+			const scv = env.SCV || 'false'; // 允许环境变量控制证书校验，默认 false（自建证书验证更安全）
 			if (订阅格式 == 'base64' || token == fakeToken) {
 				return new Response(base64Data, { headers: responseHeaders });
 			} else if (订阅格式 == 'clash') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=clash&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=clash&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=${scv}&fdn=false&sort=false&new_name=true&udp=true`;
 			} else if (订阅格式 == 'singbox') {
-				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=singbox&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=singbox&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=${scv}&fdn=false&sort=false&new_name=true&udp=true`;
 			} else if (订阅格式 == 'surge') {
 				subConverterUrl = `${subProtocol}://${subConverter}/sub?target=surge&ver=4&url=${encodeURIComponent(订阅转换URL)}&insert=false&config=${encodeURIComponent(subConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
 			} else if (订阅格式 == 'quanx') {
@@ -302,28 +303,30 @@ async function MD5MD5(text) {
 }
 
 function clashFix(content) {
-	if (content.includes('wireguard') && !content.includes('remote-dns-resolve')) {
-		let lines;
-		if (content.includes('\r\n')) {
-			lines = content.split('\r\n');
-		} else {
-			lines = content.split('\n');
+	let lines = content.includes('\r\n') ? content.split('\r\n') : content.split('\n');
+	let result = "";
+	for (let line of lines) {
+		// 修复 Wireguard
+		if (line.includes('type: wireguard') && !line.includes('remote-dns-resolve')) {
+			const 备改内容 = `, mtu: 1280, udp: true`;
+			const 正确内容 = `, mtu: 1280, remote-dns-resolve: true, udp: true`;
+			line = line.replace(new RegExp(备改内容, 'g'), 正确内容);
 		}
-
-		let result = "";
-		for (let line of lines) {
-			if (line.includes('type: wireguard')) {
-				const 备改内容 = `, mtu: 1280, udp: true`;
-				const 正确内容 = `, mtu: 1280, remote-dns-resolve: true, udp: true`;
-				result += line.replace(new RegExp(备改内容, 'g'), 正确内容) + '\n';
-			} else {
-				result += line + '\n';
+		// 修复 Trojan 节点：补全 client-fingerprint: chrome 和 udp: true
+		if (line.includes('type: trojan')) {
+			if (line.trim().endsWith('}')) {
+				line = line.trimEnd();
+				if (!line.includes('udp:')) {
+					line = line.replace(/}$/, ', udp: true}');
+				}
+				if (!line.includes('client-fingerprint:')) {
+					line = line.replace(/}$/, ', client-fingerprint: chrome}');
+				}
 			}
 		}
-
-		content = result;
+		result += line + '\n';
 	}
-	return content;
+	return result;
 }
 
 async function proxyURL(proxyURL, url) {

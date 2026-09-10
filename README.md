@@ -107,6 +107,7 @@
 | SUBNAME | `CF-Workers-SUB` | ❌ | 订阅名称 |
 | SUBAPI | `SUBAPI.cmliussss.net` | ❌ | clash、singbox等 订阅转换后端 | 
 | SUBCONFIG | [https://raw.github.../ACL4SSR_Online_MultiCountry.ini](https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini) | ❌ | clash、singbox等 订阅转换配置文件 | 
+| SCV | `false` | ❌ | 订阅转换是否跳过证书验证（默认 `false` 不跳过，提高安全性；自签名证书可设为 `true`） | 
 
 
 ## ⚠️ 注意事项
