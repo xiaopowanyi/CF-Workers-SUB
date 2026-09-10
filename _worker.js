@@ -1070,6 +1070,64 @@ export function getFailoverUrls(targetUrl, customMirror = '') {
 	return urls;
 }
 
+// 规则文件内容处理与格式适配
+export function cleanTextRuleList(rawText) {
+	if (!rawText) return '';
+	const lines = rawText.split(/\r?\n/);
+	const cleaned = [];
+	for (let line of lines) {
+		line = line.trim();
+		if (!line || line.startsWith('#') || line.startsWith(';') || line.startsWith('//')) {
+			continue;
+		}
+		const commentIdx = line.indexOf(' #');
+		if (commentIdx !== -1) {
+			line = line.slice(0, commentIdx).trim();
+		}
+		if (line.length > 0) {
+			cleaned.push(line);
+		}
+	}
+	return cleaned.join('\n') + '\n';
+}
+
+export function isYamlRulePayload(text) {
+	if (!text) return false;
+	return /^payload\s*:/m.test(text);
+}
+
+export function convertRuleListToYaml(rawText) {
+	if (!rawText) return 'payload:\n';
+	if (isYamlRulePayload(rawText)) {
+		return rawText;
+	}
+
+	const lines = rawText.split(/\r?\n/);
+	const validRules = [];
+
+	for (let line of lines) {
+		line = line.trim();
+		if (!line || line.startsWith('#') || line.startsWith(';') || line.startsWith('//')) {
+			continue;
+		}
+		if (line.startsWith('-')) {
+			line = line.slice(1).trim();
+		}
+		if ((line.startsWith("'") && line.endsWith("'")) || (line.startsWith('"') && line.endsWith('"'))) {
+			line = line.slice(1, -1).trim();
+		}
+		const commentIdx = line.indexOf(' #');
+		if (commentIdx !== -1) {
+			line = line.slice(0, commentIdx).trim();
+		}
+		if (line.length > 0) {
+			validRules.push(`  - ${JSON.stringify(line)}`);
+		}
+	}
+
+	return `payload:\n${validRules.join('\n')}\n`;
+}
+
 // 内存级规则缓存 (24小时生命周期，针对单实例及非 Worker 运行环境)
 const ruleMemoryCache = new Map();
 
@@ -1079,12 +1137,21 @@ export async function handleRuleProxyRequest(request, targetUrl, env = {}) {
 		return new Response("Invalid target URL protocol", { status: 400 });
 	}
 
+	const reqUrl = new URL(request.url);
+	let targetFormat = reqUrl.searchParams.get('format');
+	if (!targetFormat) {
+		const urlPath = cleanUrl.split('?')[0].toLowerCase();
+		targetFormat = (urlPath.endsWith('.list') || urlPath.endsWith('.txt')) ? 'text' : 'yaml';
+	}
+
 	const now = Date.now();
+	const cacheId = `${targetFormat}:${cleanUrl}`;
+
 	// 1. 优先检查内存缓存
-	const memCached = ruleMemoryCache.get(cleanUrl);
+	const memCached = ruleMemoryCache.get(cacheId);
 	if (memCached && (now - memCached.time < 86400000)) {
 		const headers = new Headers();
-		headers.set('Content-Type', 'text/yaml; charset=utf-8');
+		headers.set('Content-Type', targetFormat === 'text' ? 'text/plain; charset=utf-8' : 'text/yaml; charset=utf-8');
 		headers.set('Cache-Control', 'public, max-age=86400');
 		headers.set('Access-Control-Allow-Origin', '*');
 		headers.set('X-Cache-Status', 'HIT-MEMORY');
@@ -1092,7 +1159,7 @@ export async function handleRuleProxyRequest(request, targetUrl, env = {}) {
 	}
 
 	// 2. Cloudflare Edge 边缘缓存 (caches.default)
-	const cacheKey = new Request(cleanUrl, { method: 'GET' });
+	const cacheKey = new Request(`${cleanUrl}${cleanUrl.includes('?') ? '&' : '?'}cf_fmt=${targetFormat}`, { method: 'GET' });
 	let cache = null;
 	try {
 		if (typeof caches !== 'undefined' && caches.default) {
@@ -1120,23 +1187,29 @@ export async function handleRuleProxyRequest(request, targetUrl, env = {}) {
 			});
 			clearTimeout(timeout);
 			if (resp.ok) {
-				const text = await resp.text();
-				if (text && text.trim().length > 0) {
+				const rawBody = await resp.text();
+				if (rawBody && rawBody.trim().length > 0) {
+					// 依据目标格式对规则内容进行规范化适配
+					const processedText = targetFormat === 'text'
+						? cleanTextRuleList(rawBody)
+						: convertRuleListToYaml(rawBody);
+
 					// 写入内存缓存 (控制缓存上限 200 条防止内存膨胀)
 					if (ruleMemoryCache.size > 200) {
 						const firstKey = ruleMemoryCache.keys().next().value;
 						ruleMemoryCache.delete(firstKey);
 					}
-					ruleMemoryCache.set(cleanUrl, { text, time: now });
+					ruleMemoryCache.set(cacheId, { text: processedText, time: now });
 
 					const headers = new Headers();
-					headers.set('Content-Type', 'text/yaml; charset=utf-8');
+					headers.set('Content-Type', targetFormat === 'text' ? 'text/plain; charset=utf-8' : 'text/yaml; charset=utf-8');
 					headers.set('Cache-Control', 'public, max-age=86400');
 					headers.set('Access-Control-Allow-Origin', '*');
 					headers.set('X-Relay-Source', cand);
+					headers.set('X-Rule-Format', targetFormat);
 					headers.set('X-Cache-Status', 'MISS');
 
-					const response = new Response(text, { status: 200, headers });
+					const response = new Response(processedText, { status: 200, headers });
 					if (cache) {
 						try {
 							await cache.put(cacheKey, response.clone());
@@ -1158,7 +1231,7 @@ export async function handleRuleProxyRequest(request, targetUrl, env = {}) {
 	});
 }
 
-export function applyGhProxy(url, ghProxy = 'worker', workerRuleBase = '') {
+export function applyGhProxy(url, ghProxy = 'worker', workerRuleBase = '', format = '') {
 	if (!url) return url;
 	const cleanUrl = normalizeTargetUrl(url);
 
@@ -1179,7 +1252,9 @@ export function applyGhProxy(url, ghProxy = 'worker', workerRuleBase = '') {
 	if (ghProxy === 'worker' || ghProxy === 'relay' || ghProxy === 'edge') {
 		if (workerRuleBase) {
 			const sep = workerRuleBase.includes('?') ? '&' : '?';
-			return `${workerRuleBase}${sep}url=${encodeURIComponent(cleanUrl)}`;
+			let res = `${workerRuleBase}${sep}url=${encodeURIComponent(cleanUrl)}`;
+			if (format) res += `&format=${format}`;
+			return res;
 		}
 		// 无 workerRuleBase 上下文时回退至公共高可用镜像
 		return `https://gh-proxy.com/${cleanUrl}`;
@@ -1760,14 +1835,22 @@ proxies:
 	yaml += `\nproxy-groups:\n`;
 	yaml += builtGroups.map(formatProxyGroupYaml).join('\n\n') + '\n';
 
-	// 5. Rule-providers (根据 rule 文件名命名，支持 Worker 边缘中继与 GitHub 镜像加速)
+	// 5. Rule-providers (根据 rule 文件名与扩展名自适应 format: text / yaml，彻底杜绝 payload 报错)
 	const seenProviderNames = new Set();
-	const providerEntries = rulesets.map((r, idx) => ({
-		name: extractRuleProviderName(r.url, idx, seenProviderNames),
-		group: r.group,
-		url: applyGhProxy(r.url, ghProxy, workerRuleBase),
-		interval: r.interval || 86400
-	}));
+	const providerEntries = rulesets.map((r, idx) => {
+		const cleanUrl = r.url.split('?')[0].split('#')[0].toLowerCase();
+		const isTextList = cleanUrl.endsWith('.list') || cleanUrl.endsWith('.txt');
+		const format = isTextList ? 'text' : 'yaml';
+		const ext = isTextList ? 'list' : 'yaml';
+		return {
+			name: extractRuleProviderName(r.url, idx, seenProviderNames),
+			group: r.group,
+			url: applyGhProxy(r.url, ghProxy, workerRuleBase, format),
+			format,
+			ext,
+			interval: r.interval || 86400
+		};
+	});
 
 	if (providerEntries.length > 0) {
 		yaml += `\nrule-providers:\n`;
@@ -1775,8 +1858,9 @@ proxies:
 			yaml += `  ${p.name}:
     type: http
     behavior: classical
+    format: ${p.format}
     url: ${JSON.stringify(p.url)}
-    path: ./ruleset/${p.name}.yaml
+    path: ./ruleset/${p.name}.${p.ext}
     interval: ${p.interval}
 `;
 		});

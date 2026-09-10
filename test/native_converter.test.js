@@ -22,7 +22,10 @@ import worker, {
     applyGhProxy,
     normalizeTargetUrl,
     getFailoverUrls,
-    handleRuleProxyRequest
+    handleRuleProxyRequest,
+    cleanTextRuleList,
+    isYamlRulePayload,
+    convertRuleListToYaml
 } from '../_worker.js';
 
 test('Extract rule provider name from URL and deduplicate', () => {
@@ -170,13 +173,14 @@ ruleset=🐟 漏网之鱼,[]FINAL
     const clashYaml = generateClashConfig(processed, 'TestSub', parsedSubConfig);
     assert.ok(clashYaml.includes('rule-providers:'));
     assert.ok(clashYaml.includes('direct:'));
-    assert.ok(clashYaml.includes('path: ./ruleset/direct.yaml'));
+    assert.ok(clashYaml.includes('path: ./ruleset/direct.list'));
+    assert.ok(clashYaml.includes('format: text'));
     assert.ok(clashYaml.includes('RULE-SET,direct,全球直连'));
     assert.ok(clashYaml.includes('de:'));
-    assert.ok(clashYaml.includes('path: ./ruleset/de.yaml'));
+    assert.ok(clashYaml.includes('path: ./ruleset/de.list'));
     assert.ok(clashYaml.includes('RULE-SET,de,德国节点'));
     assert.ok(clashYaml.includes('hk:'));
-    assert.ok(clashYaml.includes('path: ./ruleset/hk.yaml'));
+    assert.ok(clashYaml.includes('path: ./ruleset/hk.list'));
     assert.ok(clashYaml.includes('RULE-SET,hk,香港节点'));
     assert.ok(clashYaml.includes('proxy:'));
     assert.ok(clashYaml.includes('RULE-SET,proxy,节点选择'));
@@ -540,7 +544,9 @@ custom_proxy_group=漏网之鱼\`select\`[]节点选择\`[]全球直连
 
     // 1. 测试 Worker 边缘中继模式 (默认)
     const clashYamlWorker = generateClashConfig(processedNodes, 'MySub', parsedSub, 'worker', 'https://mysub.workers.dev/mytoken/rule');
-    assert.ok(clashYamlWorker.includes('url: "https://mysub.workers.dev/mytoken/rule?url=https%3A%2F%2Fraw.githubusercontent.com%2Fxiaopowanyi%2FBase%2Frefs%2Fheads%2Fmain%2FRules%2Fdirect.list"'));
+    assert.ok(clashYamlWorker.includes('url: "https://mysub.workers.dev/mytoken/rule?url=https%3A%2F%2Fraw.githubusercontent.com%2Fxiaopowanyi%2FBase%2Frefs%2Fheads%2Fmain%2FRules%2Fdirect.list&format=text"'));
+    assert.ok(clashYamlWorker.includes('format: text'), '必须为 .list 规则文件自动添加 format: text 声明');
+    assert.ok(clashYamlWorker.includes('path: ./ruleset/direct.list'), '规则集路径后缀应自适应为 .list');
 
     // 2. 测试第三方镜像兼容模式 (例如用户指定 ghproxy.net 或 gh-proxy.com)
     const clashYamlProxyNet = generateClashConfig(processedNodes, 'MySub', parsedSub, 'https://ghproxy.net/');
@@ -641,4 +647,32 @@ test('Web UI includes GHPROXY settings and persists to KV', async () => {
     }), mockEnv);
     assert.equal(resSave.status, 200);
     assert.equal(kvStore.get('GHPROXY.txt'), 'worker');
+});
+
+test('Rule list adapters: cleanTextRuleList and convertRuleListToYaml', () => {
+    const rawList = `
+# This is a comment
+; Another comment
+// C-style comment
+
+DOMAIN-SUFFIX,google.com
+DOMAIN-KEYWORD,anthropic # Inline comment
+IP-CIDR,127.0.0.0/8,no-resolve
+`;
+
+    // 1. cleanTextRuleList for Mihomo format: text
+    const textOutput = cleanTextRuleList(rawList);
+    assert.ok(!textOutput.includes('#'));
+    assert.ok(!textOutput.includes(';'));
+    assert.ok(textOutput.includes('DOMAIN-SUFFIX,google.com'));
+    assert.ok(textOutput.includes('DOMAIN-KEYWORD,anthropic'));
+    assert.ok(textOutput.includes('IP-CIDR,127.0.0.0/8,no-resolve'));
+
+    // 2. convertRuleListToYaml for Classic Clash format: yaml (guaranteed payload: field)
+    const yamlOutput = convertRuleListToYaml(rawList);
+    assert.ok(isYamlRulePayload(yamlOutput), 'YAML 结果必须具有 payload 头部');
+    assert.ok(yamlOutput.includes('payload:\n'));
+    assert.ok(yamlOutput.includes('- "DOMAIN-SUFFIX,google.com"'));
+    assert.ok(yamlOutput.includes('- "DOMAIN-KEYWORD,anthropic"'));
+    assert.ok(yamlOutput.includes('- "IP-CIDR,127.0.0.0/8,no-resolve"'));
 });
