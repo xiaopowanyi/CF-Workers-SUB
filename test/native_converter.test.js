@@ -14,8 +14,24 @@ import worker, {
     generateClashConfig,
     generateBase64Config,
     parseClashProxies,
-    parseSubConfig
+    parseSubConfig,
+    extractRuleProviderName
 } from '../_worker.js';
+
+test('Extract rule provider name from URL and deduplicate', () => {
+    const seen = new Set();
+    const name1 = extractRuleProviderName('https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list', 0, seen);
+    assert.equal(name1, 'direct');
+
+    const name2 = extractRuleProviderName('https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/LocalAreaNetwork.list', 1, seen);
+    assert.equal(name2, 'LocalAreaNetwork');
+
+    const name3 = extractRuleProviderName('https://other.com/path/direct.list', 2, seen);
+    assert.equal(name3, 'direct_2'); // deduplicated!
+
+    const name4 = extractRuleProviderName('https://example.com/rules/AWAvenue-Ads-Rule.yaml', 3, seen);
+    assert.equal(name4, 'AWAvenue-Ads-Rule');
+});
 
 test('Base64 UTF-8 encoding and decoding', () => {
     const original = '你好，世界！Hello World 123! 🚀';
@@ -143,10 +159,19 @@ ruleset=全球拦截,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Cl
 
     const clashYaml = generateClashConfig(processed, 'TestSub', parsedSubConfig);
     assert.ok(clashYaml.includes('rule-providers:'));
-    assert.ok(clashYaml.includes('ruleset_0:'));
-    assert.ok(clashYaml.includes('RULE-SET,ruleset_0,全球直连'));
-    assert.ok(clashYaml.includes('RULE-SET,ruleset_1,德国节点'));
-    assert.ok(clashYaml.includes('RULE-SET,ruleset_2,香港节点'));
+    assert.ok(clashYaml.includes('direct:'));
+    assert.ok(clashYaml.includes('path: ./ruleset/direct.yaml'));
+    assert.ok(clashYaml.includes('RULE-SET,direct,全球直连'));
+    assert.ok(clashYaml.includes('de:'));
+    assert.ok(clashYaml.includes('path: ./ruleset/de.yaml'));
+    assert.ok(clashYaml.includes('RULE-SET,de,德国节点'));
+    assert.ok(clashYaml.includes('hk:'));
+    assert.ok(clashYaml.includes('path: ./ruleset/hk.yaml'));
+    assert.ok(clashYaml.includes('RULE-SET,hk,香港节点'));
+    assert.ok(clashYaml.includes('proxy:'));
+    assert.ok(clashYaml.includes('RULE-SET,proxy,节点选择'));
+    assert.ok(clashYaml.includes('BanAD:'));
+    assert.ok(clashYaml.includes('RULE-SET,BanAD,全球拦截'));
     assert.ok(clashYaml.includes('name: "香港节点"'));
     assert.ok(clashYaml.includes('name: "德国节点"'));
     assert.ok(clashYaml.includes('🇭🇰 香港 01'));

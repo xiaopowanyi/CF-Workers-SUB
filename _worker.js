@@ -1125,6 +1125,33 @@ export function proxyToClashYaml(p) {
 	return lines.join('\n');
 }
 
+export function extractRuleProviderName(url, idx, seenNames) {
+	try {
+		const clean = url.split('?')[0].split('#')[0];
+		const slashIdx = clean.lastIndexOf('/');
+		let filename = slashIdx !== -1 ? clean.slice(slashIdx + 1) : clean;
+		// 移除常见规则文件扩展名 (.list, .yaml, .yml, .txt, .conf, .json)
+		filename = filename.replace(/\.(list|yaml|yml|txt|conf|json)$/i, '');
+		// 替换非安全字符（保留字母、数字、中划线、下划线及中文常用字符）
+		filename = filename.replace(/[^\w\-\u4e00-\u9fa5]/g, '_').trim();
+		if (!filename) filename = `ruleset_${idx}`;
+
+		// 冲突去重
+		let baseName = filename;
+		let count = 1;
+		while (seenNames.has(filename)) {
+			count++;
+			filename = `${baseName}_${count}`;
+		}
+		seenNames.add(filename);
+		return filename;
+	} catch {
+		let fallback = `ruleset_${idx}`;
+		seenNames.add(fallback);
+		return fallback;
+	}
+}
+
 export function generateClashConfig(nodes, subName = 'CF-Workers-SUB', subConfigParsed = null) {
 	const proxyNames = nodes.map(n => n.name);
 
@@ -1254,25 +1281,34 @@ ${groupProxies.map(p => `      - ${JSON.stringify(p)}`).join('\n')}
       - DIRECT
 `;
 
-	// 5. Rule-providers (根据 SUBCONFIG 规则集生成)
-	if (rulesets.length > 0) {
+
+	// 5. Rule-providers (根据 rule 文件名命名)
+	const seenProviderNames = new Set();
+	const providerEntries = rulesets.map((r, idx) => ({
+		name: extractRuleProviderName(r.url, idx, seenProviderNames),
+		group: r.group,
+		url: r.url,
+		interval: r.interval || 86400
+	}));
+
+	if (providerEntries.length > 0) {
 		yaml += `\nrule-providers:\n`;
-		rulesets.forEach((r, idx) => {
-			yaml += `  ruleset_${idx}:
+		providerEntries.forEach(p => {
+			yaml += `  ${p.name}:
     type: http
     behavior: classical
-    url: ${JSON.stringify(r.url)}
-    path: ./ruleset/ruleset_${idx}.yaml
-    interval: ${r.interval || 86400}
+    url: ${JSON.stringify(p.url)}
+    path: ./ruleset/${p.name}.yaml
+    interval: ${p.interval}
 `;
 		});
 	}
 
 	// 6. 分流规则
 	yaml += `\nrules:\n`;
-	if (rulesets.length > 0) {
-		rulesets.forEach((r, idx) => {
-			yaml += `  - RULE-SET,ruleset_${idx},${r.group}\n`;
+	if (providerEntries.length > 0) {
+		providerEntries.forEach(p => {
+			yaml += `  - RULE-SET,${p.name},${p.group}\n`;
 		});
 	}
 	yaml += `  - GEOIP,LAN,DIRECT,no-resolve
