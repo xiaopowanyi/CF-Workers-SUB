@@ -915,6 +915,7 @@ export function parseSubConfig(iniText) {
 	if (!iniText) return null;
 	const lines = iniText.split(/\r?\n/);
 	const rulesets = [];
+	const directRules = [];
 	const customGroups = [];
 
 	for (let line of lines) {
@@ -926,9 +927,29 @@ export function parseSubConfig(iniText) {
 			const parts = val.split(',');
 			if (parts.length >= 2) {
 				const group = parts[0].trim();
-				const url = parts[1].trim();
-				const interval = parseInt(parts[2] || '86400', 10);
-				rulesets.push({ group, url, interval });
+				const target = parts[1].trim();
+
+				// 1. 如果以 [] 开头，是 subconverter 的内置直连规则，不是远程 rule-provider URL
+				if (target.startsWith('[]')) {
+					const ruleType = target.slice(2).trim();
+					if (ruleType.toUpperCase() === 'FINAL') {
+						directRules.push(`MATCH,${group}`);
+					} else if (ruleType.toUpperCase() === 'GEOIP') {
+						const param = parts[2] ? parts[2].trim() : 'CN';
+						directRules.push(`GEOIP,${param},${group},no-resolve`);
+					} else {
+						const restParams = parts.slice(2).map(p => p.trim()).join(',');
+						directRules.push(`${ruleType}${restParams ? ',' + restParams : ''},${group}`);
+					}
+				} else if (target.toLowerCase().startsWith('http://') || target.toLowerCase().startsWith('https://')) {
+					// 2. 只有真正的 http/https 链接才放入 rule-providers
+					const interval = parseInt(parts[2] || '86400', 10);
+					rulesets.push({ group, url: target, interval });
+				} else {
+					// 3. 直接规则定义，如 ruleset=Group,DOMAIN-SUFFIX,example.com
+					const rest = parts.slice(1).map(p => p.trim()).join(',');
+					directRules.push(`${rest},${group}`);
+				}
 			}
 		} else if (line.toLowerCase().startsWith('custom_proxy_group=')) {
 			const val = line.slice(19).trim();
@@ -936,7 +957,7 @@ export function parseSubConfig(iniText) {
 		}
 	}
 
-	return { rulesets, customGroups };
+	return { rulesets, directRules, customGroups };
 }
 
 export async function loadSubConfig(url) {
@@ -1311,10 +1332,21 @@ ${groupProxies.map(p => `      - ${JSON.stringify(p)}`).join('\n')}
 			yaml += `  - RULE-SET,${p.name},${p.group}\n`;
 		});
 	}
-	yaml += `  - GEOIP,LAN,DIRECT,no-resolve
-  - GEOIP,CN,DIRECT,no-resolve
-  - MATCH,🐟 漏网之鱼
-`;
+
+	const directRules = subConfigParsed?.directRules || [];
+	if (directRules.length > 0) {
+		for (const dr of directRules) {
+			yaml += `  - ${dr}\n`;
+		}
+	}
+
+	const hasLan = directRules.some(r => r.includes('GEOIP,LAN'));
+	const hasCn = directRules.some(r => r.includes('GEOIP,CN'));
+	const hasMatch = directRules.some(r => r.startsWith('MATCH'));
+
+	if (!hasLan) yaml += `  - GEOIP,LAN,DIRECT,no-resolve\n`;
+	if (!hasCn) yaml += `  - GEOIP,CN,DIRECT,no-resolve\n`;
+	if (!hasMatch) yaml += `  - MATCH,🐟 漏网之鱼\n`;
 
 	return yaml;
 }

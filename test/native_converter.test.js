@@ -144,9 +144,12 @@ ruleset=德国节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/hea
 ruleset=香港节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/hk.list
 ruleset=节点选择,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/proxy.list
 ruleset=全球拦截,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/BanAD.list
+ruleset=全球直连,[]GEOIP,CN
+ruleset=🐟 漏网之鱼,[]FINAL
 `;
     const parsedSubConfig = parseSubConfig(sampleIni);
-    assert.equal(parsedSubConfig.rulesets.length, 5);
+    assert.equal(parsedSubConfig.rulesets.length, 5); // 只有 5 个真正远程 http 规则集
+    assert.equal(parsedSubConfig.directRules.length, 2); // 2 个内置直接规则
     assert.equal(parsedSubConfig.rulesets[0].group, '全球直连');
     assert.equal(parsedSubConfig.rulesets[1].group, '德国节点');
 
@@ -176,6 +179,15 @@ ruleset=全球拦截,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Cl
     assert.ok(clashYaml.includes('name: "德国节点"'));
     assert.ok(clashYaml.includes('🇭🇰 香港 01'));
     assert.ok(clashYaml.includes('🇩🇪 德国 01'));
+
+    // 严苛验证：[]GEOIP 和 []FINAL 绝不能出现在 rule-providers 中
+    assert.ok(!clashYaml.includes('__GEOIP'));
+    assert.ok(!clashYaml.includes('__FINAL'));
+    assert.ok(!clashYaml.includes('url: "[]'));
+
+    // 验证它们正确直接写入 rules 区域
+    assert.ok(clashYaml.includes('GEOIP,CN,全球直连,no-resolve'));
+    assert.ok(clashYaml.includes('MATCH,🐟 漏网之鱼'));
 });
 
 test('Generate Base64 configuration', () => {
