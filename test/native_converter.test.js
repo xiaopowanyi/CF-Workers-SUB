@@ -15,7 +15,10 @@ import worker, {
     generateBase64Config,
     parseClashProxies,
     parseSubConfig,
-    extractRuleProviderName
+    extractRuleProviderName,
+    matchRegex,
+    parseCustomProxyGroup,
+    breakCycles
 } from '../_worker.js';
 
 test('Extract rule provider name from URL and deduplicate', () => {
@@ -273,4 +276,148 @@ test('Worker fetch handler - Clash and Base64 routing', async () => {
     }), mockEnv);
     assert.equal(resAutoClash.status, 200);
     assert.equal(resAutoClash.headers.get('Content-Type'), 'text/yaml; charset=utf-8');
+});
+
+test('matchRegex helper handles (?i) flag safely without regex syntax error', () => {
+    assert.ok(matchRegex('(?i)(港|香港|HK)', '🇭🇰 香港 01'));
+    assert.ok(matchRegex('(?i)(港|香港|HK)', 'my-hk-node'));
+    assert.ok(!matchRegex('(?i)(港|香港|HK)', 'US-Node-01'));
+    assert.ok(matchRegex('.*', 'Any Node Name'));
+});
+
+test('parseCustomProxyGroup parses subconverter custom group line properly', () => {
+    const line1 = '节点选择`select`[]DIRECT`.*';
+    const g1 = parseCustomProxyGroup(line1);
+    assert.equal(g1.name, '节点选择');
+    assert.equal(g1.type, 'select');
+    assert.deepEqual(g1.rules, ['[]DIRECT', '.*']);
+
+    const line2 = 'AI自动测速`url-test`[]美国节点`[]香港节点`http://www.gstatic.com/generate_204`300,,50';
+    const g2 = parseCustomProxyGroup(line2);
+    assert.equal(g2.name, 'AI自动测速');
+    assert.equal(g2.type, 'url-test');
+    assert.equal(g2.url, 'http://www.gstatic.com/generate_204');
+    assert.equal(g2.interval, 300);
+    assert.equal(g2.tolerance, 50);
+    assert.deepEqual(g2.rules, ['[]美国节点', '[]香港节点']);
+});
+
+test('breakCycles breaks intentional mutual circular loops', () => {
+    const circularGroups = [
+        { name: '节点选择', proxies: ['香港节点', 'DIRECT', 'node1'] },
+        { name: '香港节点', proxies: ['hk1', '节点选择'] }
+    ];
+    breakCycles(circularGroups);
+    // 香港节点 was referenced by 节点选择, and 节点选择 was referenced by 香港节点.
+    // breakCycles must break the cycle!
+    const selectGroup = circularGroups.find(g => g.name === '节点选择');
+    assert.ok(!selectGroup.proxies.includes('香港节点'));
+    assert.ok(selectGroup.proxies.includes('DIRECT'));
+});
+
+test('generateClashConfig with user my.ini produces ZERO circular loops in ProxyGroups', () => {
+    const myIniText = `
+[custom]
+ruleset=全球直连,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/direct.list
+ruleset=德国节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/de.list
+ruleset=香港节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/hk.list
+ruleset=节点选择,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/proxy.list
+ruleset=新加坡节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/sg.list
+ruleset=台湾节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/tw.list
+ruleset=美国节点,https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/us.list
+ruleset=全球拦截,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/BanAD.list
+ruleset=应用净化,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/BanProgramAD.list
+ruleset=谷歌FCM,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/GoogleFCM.list
+ruleset=微软服务,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Microsoft.list
+ruleset=电报信息,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Telegram.list
+ruleset=OpenAi,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/OpenAi.list
+ruleset=油管视频,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/YouTube.list
+ruleset=奈飞视频,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Netflix.list
+ruleset=国外媒体,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ProxyMedia.list
+ruleset=全球直连,[]GEOIP,LAN
+ruleset=全球直连,[]GEOIP,CN
+ruleset=漏网之鱼,[]FINAL
+
+custom_proxy_group=节点选择\`select\`[]DIRECT\`.*
+custom_proxy_group=AI自动测速\`url-test\`[]美国节点\`[]香港节点\`[]日本节点\`[]新加坡节点\`http://www.gstatic.com/generate_204\`300
+custom_proxy_group=OpenAi\`select\`[]AI自动测速\`[]美国节点\`[]日本节点\`[]新加坡节点\`[]节点选择
+custom_proxy_group=油管视频\`select\`[]节点选择\`[]香港节点\`[]美国节点\`[]全球直连
+custom_proxy_group=奈飞视频\`select\`[]节点选择\`[]香港节点\`[]台湾节点\`[]全球直连
+custom_proxy_group=国外媒体\`select\`[]节点选择\`[]香港节点\`[]日本节点\`[]全球直连
+custom_proxy_group=电报信息\`select\`[]节点选择\`[]全球直连
+custom_proxy_group=微软服务\`select\`[]节点选择\`[]全球直连
+custom_proxy_group=谷歌FCM\`select\`[]节点选择\`[]全球直连
+custom_proxy_group=全球直连\`select\`[]DIRECT\`[]节点选择
+custom_proxy_group=全球拦截\`select\`[]REJECT\`[]全球直连
+custom_proxy_group=应用净化\`select\`[]REJECT\`[]全球直连
+custom_proxy_group=漏网之鱼\`select\`[]节点选择\`[]香港节点\`[]全球直连
+custom_proxy_group=香港节点\`select\`(?i)(港|香港|HK|Hong Kong|🇭🇰|HongKong)
+custom_proxy_group=台湾节点\`select\`(?i)(台|台湾|台灣|TW|Tai Wan|🇹🇼|TaiWan|Taiwan)
+custom_proxy_group=新加坡节点\`select\`(?i)(新|新加坡|SG|坡|狮城|🇸🇬|Singapore)
+custom_proxy_group=韩国节点\`select\`(?i)(韩|韩国|韓國|KR|首尔|春川|🇰🇷|Korea)
+custom_proxy_group=日本节点\`select\`(?i)(日|日本|JP|川日|东京|大阪|泉日|埼玉|沪日|深日|🇯🇵|Japan)
+custom_proxy_group=德国节点\`select\`(?i)(德|德国|法兰克福|DE|🇩🇪|Germany)
+custom_proxy_group=英国节点\`select\`(?i)(英|英国|UK|England|United Kingdom|伦敦|🇬🇧)
+custom_proxy_group=美国节点\`select\`(?i)(美|美国|US|纽约|波特兰|达拉斯|俄勒|凤凰城|费利蒙|硅谷|拉斯|洛杉|圣何塞|圣克拉|西雅|芝加|🇺🇸|United States)
+`;
+
+    const parsedSub = parseSubConfig(myIniText);
+    const mockNodes = [
+        parseNode('trojan://p1@1.1.1.1:443#🇭🇰 香港 01'),
+        parseNode('trojan://p2@2.2.2.2:443#🇩🇪 德国 01'),
+        parseNode('trojan://p3@3.3.3.3:443#🇺🇸 美国 01'),
+        parseNode('trojan://p4@4.4.4.4:443#🇹🇼 台湾 01'),
+        parseNode('trojan://p5@5.5.5.5:443#🇸🇬 新加坡 01')
+    ];
+    const processedNodes = processNodes(mockNodes);
+    const clashYaml = generateClashConfig(processedNodes, 'MySub', parsedSub);
+
+    // 验证关键策略组正常生成
+    assert.ok(clashYaml.includes('name: "OpenAi"'));
+    assert.ok(clashYaml.includes('name: "油管视频"'));
+    assert.ok(clashYaml.includes('name: "奈飞视频"'));
+    assert.ok(clashYaml.includes('name: "节点选择"'));
+    assert.ok(clashYaml.includes('name: "香港节点"'));
+    assert.ok(clashYaml.includes('name: "漏网之鱼"'));
+
+    // 严格图论环路检测：解析 YAML 中的 proxy-groups 邻接表，断言无任何环路
+    const pgSection = clashYaml.split('\nproxy-groups:\n')[1].split(/\n(?:rule-providers|rules):/)[0];
+    const groupMatches = [...pgSection.matchAll(/  - name:\s*"([^"]+)"\s*\n\s*type:\s*(\S+)[\s\S]*?proxies:\n([\s\S]*?)(?=\n  - name:|$)/g)];
+    const groupNames = new Set(groupMatches.map(m => m[1]));
+    const adj = new Map();
+
+    for (const m of groupMatches) {
+        const gName = m[1];
+        const proxyLines = m[3].split('\n').map(l => l.trim()).filter(l => l.startsWith('-'));
+        const proxies = proxyLines.map(l => {
+            const raw = l.slice(1).trim();
+            try { return JSON.parse(raw); } catch { return raw; }
+        });
+        adj.set(gName, proxies.filter(p => groupNames.has(p)));
+    }
+
+    // DFS 环路检测
+    const visited = new Map();
+    const detectedCycles = [];
+    function dfs(u, path) {
+        visited.set(u, 1);
+        path.push(u);
+        for (const v of adj.get(u) || []) {
+            const state = visited.get(v) || 0;
+            if (state === 1) {
+                const idx = path.indexOf(v);
+                detectedCycles.push(path.slice(idx).concat(v));
+            } else if (state === 0) {
+                dfs(v, path);
+            }
+        }
+        path.pop();
+        visited.set(u, 2);
+    }
+
+    for (const g of groupNames) {
+        if (!visited.has(g)) dfs(g, []);
+    }
+
+    assert.equal(detectedCycles.length, 0, `Detected circular loops in proxy-groups: ${JSON.stringify(detectedCycles)}`);
 });

@@ -1012,6 +1012,97 @@ function matchNodesByRegion(nodes, groupName) {
 	return nodes.filter(n => pattern.test(n.name));
 }
 
+export function matchRegex(patternStr, targetStr) {
+	try {
+		let pattern = patternStr;
+		let flags = '';
+		if (pattern.startsWith('(?i)')) {
+			pattern = pattern.slice(4);
+			flags = 'i';
+		}
+		const re = new RegExp(pattern, flags);
+		return re.test(targetStr);
+	} catch {
+		return false;
+	}
+}
+
+export function parseCustomProxyGroup(rawLine) {
+	const parts = rawLine.split('`').map(s => s.trim()).filter(Boolean);
+	if (parts.length < 2) return null;
+
+	const name = parts[0];
+	const type = parts[1].toLowerCase();
+	const rules = [];
+	let url = 'http://www.gstatic.com/generate_204';
+	let interval = 300;
+	let tolerance = 50;
+
+	for (let i = 2; i < parts.length; i++) {
+		const part = parts[i];
+		if (part.startsWith('http://') || part.startsWith('https://')) {
+			url = part;
+		} else if (/^\d+(?:,\s*,\s*\d+)?$/.test(part)) {
+			const numParts = part.split(',').map(s => s.trim()).filter(Boolean);
+			if (numParts.length >= 1) interval = parseInt(numParts[0], 10) || 300;
+			if (numParts.length >= 2) tolerance = parseInt(numParts[1], 10) || 50;
+		} else {
+			rules.push(part);
+		}
+	}
+
+	return { name, type, rules, url, interval, tolerance };
+}
+
+export function breakCycles(groups) {
+	const groupMap = new Map(groups.map(g => [g.name, g]));
+	const groupNames = new Set(groupMap.keys());
+
+	function canReach(start, target, visited = new Set()) {
+		if (start === target) return true;
+		visited.add(start);
+		const g = groupMap.get(start);
+		if (!g) return false;
+		for (const p of g.proxies || []) {
+			if (groupNames.has(p) && !visited.has(p)) {
+				if (canReach(p, target, visited)) return true;
+			}
+		}
+		return false;
+	}
+
+	for (const g of groups) {
+		const safeProxies = [];
+		for (const p of g.proxies || []) {
+			if (groupNames.has(p)) {
+				if (canReach(p, g.name)) {
+					// 环路阻断：跳过该策略，避免产生相互嵌套造成的 loop is detected in ProxyGroup
+					continue;
+				}
+			}
+			safeProxies.push(p);
+		}
+		if (safeProxies.length === 0) {
+			safeProxies.push('DIRECT');
+		}
+		g.proxies = safeProxies;
+	}
+}
+
+export function formatProxyGroupYaml(g) {
+	let str = `  - name: ${JSON.stringify(g.name)}\n    type: ${g.type}\n`;
+	if (g.type === 'url-test' || g.type === 'fallback' || g.type === 'load-balance') {
+		str += `    url: ${g.url || 'http://www.gstatic.com/generate_204'}\n`;
+		str += `    interval: ${g.interval || 300}\n`;
+		if (g.type === 'url-test' && g.tolerance !== undefined) {
+			str += `    tolerance: ${g.tolerance}\n`;
+		}
+	}
+	str += `    proxies:\n`;
+	str += (g.proxies || []).map(p => `      - ${JSON.stringify(p)}`).join('\n');
+	return str;
+}
+
 // ==========================================
 // 5. 原生 Clash / Mihomo YAML 生成器 (严格按填写的节点参数，不赋多余默认值)
 // ==========================================
@@ -1214,94 +1305,152 @@ proxies:
 		if (r.group) neededGroups.add(r.group);
 	}
 
-	// 构建策略组
-	yaml += `\nproxy-groups:\n`;
-
-	// 1. 主策略组 (节点选择)
-	const regionGroups = [];
-	for (const g of neededGroups) {
-		if (g !== '节点选择' && g !== '全球直连' && g !== '全球拦截' && g !== '应用净化' && g !== 'DIRECT' && g !== 'REJECT') {
-			regionGroups.push(g);
+	const directRules = subConfigParsed?.directRules || [];
+	for (const dr of directRules) {
+		const parts = dr.split(',');
+		if (parts.length >= 2) {
+			const grp = parts[parts.length - (parts[parts.length - 1] === 'no-resolve' ? 2 : 1)].trim();
+			if (grp) neededGroups.add(grp);
 		}
 	}
 
-	const mainSelectProxies = ["♻️ 自动选择", "🔯 故障转移", ...regionGroups, "DIRECT", ...proxyNames];
-	yaml += `  - name: "节点选择"
-    type: select
-    proxies:
-${mainSelectProxies.map(p => `      - ${JSON.stringify(p)}`).join('\n')}
+	const builtGroups = [];
 
-  - name: "♻️ 自动选择"
-    type: url-test
-    url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
-    proxies:
-${proxyNames.length > 0 ? proxyNames.map(name => `      - ${JSON.stringify(name)}`).join('\n') : '      - DIRECT'}
+	if (subConfigParsed?.customGroups && subConfigParsed.customGroups.length > 0) {
+		const parsedCustom = subConfigParsed.customGroups
+			.map(parseCustomProxyGroup)
+			.filter(Boolean);
 
-  - name: "🔯 故障转移"
-    type: fallback
-    url: http://www.gstatic.com/generate_204
-    interval: 300
-    proxies:
-${proxyNames.length > 0 ? proxyNames.map(name => `      - ${JSON.stringify(name)}`).join('\n') : '      - DIRECT'}
-`;
+		for (const cg of parsedCustom) {
+			const proxies = [];
+			for (const r of cg.rules) {
+				if (r.startsWith('[]')) {
+					const target = r.slice(2).trim();
+					if (target) proxies.push(target);
+				} else {
+					const matched = nodes.filter(n => matchRegex(r, n.name)).map(n => n.name);
+					proxies.push(...matched);
+				}
+			}
 
-	// 2. 地区与特定策略组
-	for (const g of regionGroups) {
-		const matchedNodes = matchNodesByRegion(nodes, g);
-		const groupProxies = matchedNodes.length > 0
-			? [...matchedNodes.map(n => n.name), "节点选择", "DIRECT"]
-			: ["节点选择", "DIRECT", ...proxyNames];
+			if (proxies.length === 0) {
+				if (cg.type === 'url-test' || cg.type === 'fallback') {
+					if (proxyNames.length > 0) proxies.push(...proxyNames);
+					else proxies.push('DIRECT');
+				} else {
+					proxies.push('DIRECT');
+				}
+			}
 
-		yaml += `
-  - name: ${JSON.stringify(g)}
-    type: select
-    proxies:
-${groupProxies.map(p => `      - ${JSON.stringify(p)}`).join('\n')}
-`;
+			builtGroups.push({
+				name: cg.name,
+				type: cg.type,
+				url: cg.url,
+				interval: cg.interval,
+				tolerance: cg.tolerance,
+				proxies: Array.from(new Set(proxies))
+			});
+		}
+
+		// 补充在 ruleset 中出现但 custom_proxy_group 未定义的策略组
+		const existingNames = new Set(builtGroups.map(g => g.name));
+		for (const g of neededGroups) {
+			if (existingNames.has(g) || g === 'DIRECT' || g === 'REJECT') continue;
+			const matchedNodes = matchNodesByRegion(nodes, g);
+			const proxies = matchedNodes.length > 0
+				? [...matchedNodes.map(n => n.name), "节点选择", "DIRECT"]
+				: ["节点选择", "DIRECT", ...proxyNames];
+			builtGroups.push({
+				name: g,
+				type: 'select',
+				proxies: Array.from(new Set(proxies))
+			});
+			existingNames.add(g);
+		}
+	} else {
+		// 默认策略组（严格单向 DAG 拓扑无环，杜绝策略组相互嵌套）
+		const regionGroups = [];
+		for (const g of neededGroups) {
+			if (g !== '节点选择' && g !== '全球直连' && g !== '全球拦截' && g !== '应用净化' && g !== 'DIRECT' && g !== 'REJECT' && g !== '🐟 漏网之鱼' && g !== '漏网之鱼') {
+				regionGroups.push(g);
+			}
+		}
+
+		// 1. 节点选择（绝不包含下游 regionGroups，防止形成相互循环引用）
+		const mainSelectProxies = ["♻️ 自动选择", "🔯 故障转移", "DIRECT", ...proxyNames];
+		builtGroups.push({
+			name: "节点选择",
+			type: "select",
+			proxies: Array.from(new Set(mainSelectProxies))
+		});
+
+		builtGroups.push({
+			name: "♻️ 自动选择",
+			type: "url-test",
+			url: "http://www.gstatic.com/generate_204",
+			interval: 300,
+			tolerance: 50,
+			proxies: proxyNames.length > 0 ? [...proxyNames] : ["DIRECT"]
+		});
+
+		builtGroups.push({
+			name: "🔯 故障转移",
+			type: "fallback",
+			url: "http://www.gstatic.com/generate_204",
+			interval: 300,
+			proxies: proxyNames.length > 0 ? [...proxyNames] : ["DIRECT"]
+		});
+
+		for (const g of regionGroups) {
+			const matchedNodes = matchNodesByRegion(nodes, g);
+			const groupProxies = matchedNodes.length > 0
+				? [...matchedNodes.map(n => n.name), "节点选择", "DIRECT"]
+				: ["节点选择", "DIRECT", ...proxyNames];
+			builtGroups.push({
+				name: g,
+				type: "select",
+				proxies: Array.from(new Set(groupProxies))
+			});
+		}
+
+		if (neededGroups.has('全球直连')) {
+			builtGroups.push({
+				name: "全球直连",
+				type: "select",
+				proxies: ["DIRECT", "节点选择"]
+			});
+		}
+
+		if (neededGroups.has('全球拦截')) {
+			builtGroups.push({
+				name: "全球拦截",
+				type: "select",
+				proxies: ["REJECT", "DIRECT"]
+			});
+		}
+
+		if (neededGroups.has('应用净化')) {
+			builtGroups.push({
+				name: "应用净化",
+				type: "select",
+				proxies: ["REJECT", "DIRECT"]
+			});
+		}
+
+		const finalName = neededGroups.has('漏网之鱼') ? '漏网之鱼' : '🐟 漏网之鱼';
+		builtGroups.push({
+			name: finalName,
+			type: "select",
+			proxies: ["节点选择", "DIRECT"]
+		});
 	}
 
-	// 3. 直连与拦截组
-	if (neededGroups.has('全球直连')) {
-		yaml += `
-  - name: "全球直连"
-    type: select
-    proxies:
-      - DIRECT
-      - "节点选择"
-`;
-	}
+	// 最终防环检查：破除任何潜在的循环引用（有向图拓扑无环化）
+	breakCycles(builtGroups);
 
-	if (neededGroups.has('全球拦截')) {
-		yaml += `
-  - name: "全球拦截"
-    type: select
-    proxies:
-      - REJECT
-      - DIRECT
-`;
-	}
-
-	if (neededGroups.has('应用净化')) {
-		yaml += `
-  - name: "应用净化"
-    type: select
-    proxies:
-      - REJECT
-      - DIRECT
-`;
-	}
-
-	// 4. 漏网之鱼
-	yaml += `
-  - name: "🐟 漏网之鱼"
-    type: select
-    proxies:
-      - "节点选择"
-      - DIRECT
-`;
-
+	// 构建 YAML proxy-groups
+	yaml += `\nproxy-groups:\n`;
+	yaml += builtGroups.map(formatProxyGroupYaml).join('\n\n') + '\n';
 
 	// 5. Rule-providers (根据 rule 文件名命名)
 	const seenProviderNames = new Set();
@@ -1333,20 +1482,29 @@ ${groupProxies.map(p => `      - ${JSON.stringify(p)}`).join('\n')}
 		});
 	}
 
-	const directRules = subConfigParsed?.directRules || [];
-	if (directRules.length > 0) {
-		for (const dr of directRules) {
+	const nonMatchDirectRules = directRules.filter(r => !r.startsWith('MATCH'));
+	const matchDirectRules = directRules.filter(r => r.startsWith('MATCH'));
+
+	if (nonMatchDirectRules.length > 0) {
+		for (const dr of nonMatchDirectRules) {
 			yaml += `  - ${dr}\n`;
 		}
 	}
 
 	const hasLan = directRules.some(r => r.includes('GEOIP,LAN'));
 	const hasCn = directRules.some(r => r.includes('GEOIP,CN'));
-	const hasMatch = directRules.some(r => r.startsWith('MATCH'));
 
 	if (!hasLan) yaml += `  - GEOIP,LAN,DIRECT,no-resolve\n`;
 	if (!hasCn) yaml += `  - GEOIP,CN,DIRECT,no-resolve\n`;
-	if (!hasMatch) yaml += `  - MATCH,🐟 漏网之鱼\n`;
+
+	if (matchDirectRules.length > 0) {
+		for (const mr of matchDirectRules) {
+			yaml += `  - ${mr}\n`;
+		}
+	} else {
+		const finalGroup = neededGroups.has('漏网之鱼') ? '漏网之鱼' : (neededGroups.has('🐟 漏网之鱼') ? '🐟 漏网之鱼' : '节点选择');
+		yaml += `  - MATCH,${finalGroup}\n`;
+	}
 
 	return yaml;
 }
