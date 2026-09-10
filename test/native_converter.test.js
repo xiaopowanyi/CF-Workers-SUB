@@ -19,7 +19,10 @@ import worker, {
     matchRegex,
     parseCustomProxyGroup,
     breakCycles,
-    applyGhProxy
+    applyGhProxy,
+    normalizeTargetUrl,
+    getFailoverUrls,
+    handleRuleProxyRequest
 } from '../_worker.js';
 
 test('Extract rule provider name from URL and deduplicate', () => {
@@ -470,18 +473,37 @@ test('Web UI rendering and KV configuration persistence', async () => {
 
 test('applyGhProxy accelerates raw.githubusercontent.com URLs', () => {
     const rawUrl = 'https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list';
-    const proxied = applyGhProxy(rawUrl);
-    assert.equal(proxied, 'https://ghproxy.net/https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list');
+    
+    // 1. Worker 边缘中继模式 (默认)
+    const workerRelay = applyGhProxy(rawUrl, 'worker', 'https://mysub.workers.dev/mytoken/rule');
+    assert.equal(workerRelay, 'https://mysub.workers.dev/mytoken/rule?url=' + encodeURIComponent(rawUrl));
 
-    // Does not double proxy
-    assert.equal(applyGhProxy(proxied), proxied);
+    // 2. 第三方镜像模式
+    assert.equal(applyGhProxy(rawUrl, 'https://gh-proxy.com'), 'https://gh-proxy.com/https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list');
+    assert.equal(applyGhProxy(rawUrl, 'https://ghproxy.net/'), 'https://ghproxy.net/https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list');
+    assert.equal(applyGhProxy(rawUrl, 'https://ghfast.top/'), 'https://ghfast.top/https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list');
 
-    // Can be disabled with 'false' or 'off'
+    // 3. 直连模式 (关闭加速)
+    assert.equal(applyGhProxy(rawUrl, 'direct'), rawUrl);
     assert.equal(applyGhProxy(rawUrl, 'false'), rawUrl);
     assert.equal(applyGhProxy(rawUrl, 'off'), rawUrl);
 
-    // Supports custom proxy prefix
-    assert.equal(applyGhProxy(rawUrl, 'https://gh-proxy.com'), 'https://gh-proxy.com/https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list');
+    // 4. 防重复代理 (剥离已存在镜像前缀)
+    const alreadyMirrored = 'https://ghproxy.net/https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list';
+    assert.equal(normalizeTargetUrl(alreadyMirrored), rawUrl);
+});
+
+test('Multi-source failover pool generates prioritized sources', () => {
+    const rawUrl = 'https://raw.githubusercontent.com/xiaopowanyi/Base/main/Rules/direct.list';
+    const failoverList = getFailoverUrls(rawUrl);
+
+    // 必须首先尝试直连源站
+    assert.equal(failoverList[0], rawUrl);
+    // 必须包含高可用镜像池，杜绝 ghproxy.net 单点宕机故障
+    assert.ok(failoverList.includes('https://gh-proxy.com/' + rawUrl));
+    assert.ok(failoverList.includes('https://ghfast.top/' + rawUrl));
+    assert.ok(failoverList.includes('https://ghproxy.net/' + rawUrl));
+    assert.ok(failoverList.includes('https://raw.gitmirror.com/xiaopowanyi/Base/main/Rules/direct.list'));
 });
 
 test('generateClashConfig fixes: DIRECT moved to end of 节点选择, AI自动测速 filters empty groups, rule-providers accelerated', () => {
@@ -515,13 +537,17 @@ custom_proxy_group=漏网之鱼\`select\`[]节点选择\`[]全球直连
         parseNode('trojan://p5@5.5.5.5:443#HuaWei-HK-Trojan')
     ];
     const processedNodes = processNodes(mockNodes);
-    const clashYaml = generateClashConfig(processedNodes, 'MySub', parsedSub);
 
-    // 1. 验证 rule-providers 包含 ghproxy 加速链接
-    assert.ok(clashYaml.includes('url: "https://ghproxy.net/https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/direct.list"'));
+    // 1. 测试 Worker 边缘中继模式 (默认)
+    const clashYamlWorker = generateClashConfig(processedNodes, 'MySub', parsedSub, 'worker', 'https://mysub.workers.dev/mytoken/rule');
+    assert.ok(clashYamlWorker.includes('url: "https://mysub.workers.dev/mytoken/rule?url=https%3A%2F%2Fraw.githubusercontent.com%2Fxiaopowanyi%2FBase%2Frefs%2Fheads%2Fmain%2FRules%2Fdirect.list"'));
 
-    // 2. 解析 proxy-groups
-    const pgSection = clashYaml.split('\nproxy-groups:\n')[1].split(/\n(?:rule-providers|rules):/)[0];
+    // 2. 测试第三方镜像兼容模式 (例如用户指定 ghproxy.net 或 gh-proxy.com)
+    const clashYamlProxyNet = generateClashConfig(processedNodes, 'MySub', parsedSub, 'https://ghproxy.net/');
+    assert.ok(clashYamlProxyNet.includes('url: "https://ghproxy.net/https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/direct.list"'));
+
+    // 3. 解析 proxy-groups
+    const pgSection = clashYamlWorker.split('\nproxy-groups:\n')[1].split(/\n(?:rule-providers|rules):/)[0];
     const groupMatches = [...pgSection.matchAll(/  - name:\s*"([^"]+)"\s*\n\s*type:\s*(\S+)[\s\S]*?proxies:\n([\s\S]*?)(?=\n  - name:|$)/g)];
     const groups = new Map();
 
@@ -550,4 +576,69 @@ custom_proxy_group=漏网之鱼\`select\`[]节点选择\`[]全球直连
     assert.ok(aiTest.proxies.includes('新加坡节点'));
     assert.ok(!aiTest.proxies.includes('日本节点'), 'AI自动测速必须剔除只有 DIRECT 的空国家分组');
     assert.ok(!aiTest.proxies.includes('DIRECT'), 'AI自动测速中不应包含 DIRECT');
+});
+
+test('Rule relay endpoint (/rule) handles authorization, failover and edge caching', async () => {
+    const mockEnv = {
+        TOKEN: 'mytesttoken',
+        GUESTTOKEN: 'myguesttoken'
+    };
+
+    // 1. 无效 Token 访问 /rule -> 拦截并返回 decoy
+    const resUnauthorized = await worker.fetch(new Request('https://mysub.workers.dev/wrongtoken/rule?url=https://raw.githubusercontent.com/test/rule.list'), mockEnv);
+    assert.equal(resUnauthorized.status, 200);
+    const htmlText = await resUnauthorized.text();
+    assert.ok(htmlText.includes('Welcome to nginx!'));
+
+    // 2. 有效 Token 但缺少 url 参数 -> 400 Bad Request
+    const resNoUrl = await worker.fetch(new Request('https://mysub.workers.dev/mytesttoken/rule'), mockEnv);
+    assert.equal(resNoUrl.status, 400);
+
+    // 3. 有效 Token 并请求有效规则文件 -> 成功拉取并设置缓存头
+    const directUrl = 'https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/Rules/direct.list';
+    const resRule = await worker.fetch(new Request(`https://mysub.workers.dev/mytesttoken/rule?url=${encodeURIComponent(directUrl)}`), mockEnv);
+    assert.equal(resRule.status, 200);
+    assert.equal(resRule.headers.get('Cache-Control'), 'public, max-age=86400');
+    const content = await resRule.text();
+    assert.ok(content.length > 0);
+
+    // 4. 第二次请求 -> 触发内存或边缘命中 (HIT)
+    const resRuleCached = await worker.fetch(new Request(`https://mysub.workers.dev/mytesttoken/rule?url=${encodeURIComponent(directUrl)}`), mockEnv);
+    assert.equal(resRuleCached.status, 200);
+    assert.equal(resRuleCached.headers.get('X-Cache-Status'), 'HIT-MEMORY');
+});
+
+test('Web UI includes GHPROXY settings and persists to KV', async () => {
+    const kvStore = new Map();
+    const mockEnv = {
+        TOKEN: 'mytesttoken',
+        KV: {
+            get: async (key) => kvStore.get(key) || null,
+            put: async (key, val) => kvStore.set(key, val),
+            delete: async (key) => kvStore.delete(key)
+        }
+    };
+
+    // 1. GET 请求管理页面 -> 验证包含 GHPROXY 选择与描述
+    const resPage = await worker.fetch(new Request('https://mysub.workers.dev/mytesttoken', {
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+    }), mockEnv);
+    assert.equal(resPage.status, 200);
+    const pageHtml = await resPage.text();
+    assert.ok(pageHtml.includes('ghProxySelect'), '必须包含规则集加速选择器');
+    assert.ok(pageHtml.includes('规则集加速与容灾中继'), '页面必须包含容灾中继卡片');
+
+    // 2. POST 保存 GHPROXY 配置 -> 写入 KV GHPROXY.txt
+    const savePayload = {
+        link: 'trojan://p@1.1.1.1:443#Test',
+        subConfig: 'https://raw.githubusercontent.com/test/my.ini',
+        ghProxy: 'worker'
+    };
+    const resSave = await worker.fetch(new Request('https://mysub.workers.dev/mytesttoken', {
+        method: 'POST',
+        body: JSON.stringify(savePayload),
+        headers: { 'Content-Type': 'application/json' }
+    }), mockEnv);
+    assert.equal(resSave.status, 200);
+    assert.equal(kvStore.get('GHPROXY.txt'), 'worker');
 });

@@ -51,8 +51,19 @@ export default {
 		if (!guestToken) guestToken = await MD5MD5(mytoken);
 		const 访客订阅 = guestToken;
 
-		// 鉴权检查
+		// 路径解析与鉴权检查
+		const pathSegments = url.pathname.split('/').filter(Boolean);
+		const isRuleReq = pathSegments.includes('rule');
+
+		let reqToken = token;
+		if (!reqToken && pathSegments.length > 0) {
+			if (pathSegments[0] !== 'sub' && pathSegments[0] !== 'rule') {
+				reqToken = pathSegments[0];
+			}
+		}
+
 		const isAuthorized = [mytoken, fakeToken, 访客订阅].includes(token) ||
+			[mytoken, fakeToken, 访客订阅].includes(reqToken) ||
 			url.pathname === ("/" + mytoken) ||
 			url.pathname.includes("/" + mytoken + "?") ||
 			(url.pathname === "/sub" && [mytoken, fakeToken, 访客订阅].includes(token));
@@ -69,6 +80,15 @@ export default {
 			});
 		}
 
+		// 处理规则集中继请求 (/rule 或 /*/rule)
+		if (isRuleReq) {
+			const targetUrl = url.searchParams.get('url');
+			if (!targetUrl) {
+				return new Response('缺少 url 参数', { status: 400 });
+			}
+			return await handleRuleProxyRequest(request, targetUrl, env);
+		}
+
 		// 解析当前生效的 SUBCONFIG (优先级: URL参数 ?config= > KV 中保存的 CONFIG.txt > 环境变量 SUBCONFIG > 默认 subConfig)
 		let currentSubConfig = url.searchParams.get('config');
 		if (!currentSubConfig && env.KV) {
@@ -78,12 +98,21 @@ export default {
 			currentSubConfig = env.SUBCONFIG || subConfig;
 		}
 
+		// 解析当前生效的 GHPROXY (优先级: URL参数 ?ghproxy= > KV 中保存的 GHPROXY.txt > 环境变量 GH_PROXY/GHPROXY > 默认 'worker')
+		let currentGhProxy = url.searchParams.get('ghproxy');
+		if (!currentGhProxy && env.KV) {
+			currentGhProxy = await env.KV.get('GHPROXY.txt');
+		}
+		if (!currentGhProxy) {
+			currentGhProxy = env.GH_PROXY || env.GHPROXY || 'worker';
+		}
+
 		// KV 管理页面与数据加载
 		if (env.KV) {
 			await 迁移地址列表(env, 'LINK.txt');
-			if (userAgent.includes('mozilla') && !url.search && url.pathname !== '/sub') {
+			if ((request.method === "POST" || userAgent.includes('mozilla')) && !url.search && url.pathname !== '/sub') {
 				await sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}\n域名: ${url.hostname}\n入口: ${url.pathname + url.search}`);
-				return await renderKVPage(request, env, 'LINK.txt', 访客订阅, currentSubConfig);
+				return await renderKVPage(request, env, 'LINK.txt', 访客订阅, currentSubConfig, currentGhProxy);
 			} else {
 				MainData = await env.KV.get('LINK.txt') || MainData;
 			}
@@ -170,14 +199,16 @@ export default {
 
 		if (outputFormat === 'clash') {
 			responseHeaders["Content-Type"] = "text/yaml; charset=utf-8";
-			// 解析 GitHub 规则加速代理 (默认 https://ghproxy.net/)
-			let currentGhProxy = url.searchParams.get('ghproxy');
-			if (currentGhProxy === null || currentGhProxy === undefined) {
-				currentGhProxy = env.GH_PROXY || env.GHPROXY || 'https://ghproxy.net/';
-			}
+			// 确定有效的订阅 Token 用于构建规则中继基础 URL
+			const effectiveToken = (token && [mytoken, fakeToken, 访客订阅].includes(token))
+				? token
+				: (reqToken && [mytoken, fakeToken, 访客订阅].includes(reqToken) ? reqToken : mytoken);
+			const origin = (url.origin && url.origin !== 'null') ? url.origin : `https://${url.host}`;
+			const workerRuleBase = `${origin}/${effectiveToken}/rule`;
+
 			// 根据当前选择或配置的 SUBCONFIG 解析规则与分组
 			const subConfigParsed = await loadSubConfig(currentSubConfig, currentGhProxy);
-			const clashYaml = generateClashConfig(allNodes, FileName, subConfigParsed, currentGhProxy);
+			const clashYaml = generateClashConfig(allNodes, FileName, subConfigParsed, currentGhProxy, workerRuleBase);
 			return new Response(clashYaml, { headers: responseHeaders });
 		} else {
 			responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
@@ -965,25 +996,202 @@ export function parseSubConfig(iniText) {
 	return { rulesets, directRules, customGroups };
 }
 
-export function applyGhProxy(url, ghProxy = 'https://ghproxy.net/') {
-	if (!url || !ghProxy || ghProxy === 'false' || ghProxy === 'none' || ghProxy === 'off') {
-		return url;
+// ==========================================
+// 4.1 GitHub 规则集多源容灾与边缘中继系统
+// ==========================================
+
+export function normalizeTargetUrl(url) {
+	if (!url) return '';
+	let clean = url.trim();
+	const mirrorPrefixes = [
+		'https://gh-proxy.com/',
+		'http://gh-proxy.com/',
+		'https://ghfast.top/',
+		'http://ghfast.top/',
+		'https://ghproxy.net/',
+		'http://ghproxy.net/',
+		'https://ghproxy.com/',
+		'http://ghproxy.com/',
+		'https://raw.gitmirror.com/'
+	];
+	for (const p of mirrorPrefixes) {
+		if (clean.startsWith(p)) {
+			let rest = clean.slice(p.length);
+			if (p === 'https://raw.gitmirror.com/' && !rest.startsWith('http')) {
+				rest = `https://raw.githubusercontent.com/${rest}`;
+			}
+			clean = rest;
+			break;
+		}
 	}
-	let prefix = ghProxy.trim();
-	if (!prefix.endsWith('/')) prefix += '/';
-	if (url.startsWith(prefix) || url.includes('ghproxy') || url.includes('gh-proxy')) {
-		return url;
-	}
-	if (url.startsWith('https://raw.githubusercontent.com/') || url.startsWith('http://raw.githubusercontent.com/')) {
-		return `${prefix}${url}`;
-	}
-	if (url.startsWith('https://github.com/') && url.includes('/raw/')) {
-		return `${prefix}${url}`;
-	}
-	return url;
+	return clean;
 }
 
-export async function loadSubConfig(url, ghProxy = 'https://ghproxy.net/') {
+export function getFailoverUrls(targetUrl, customMirror = '') {
+	const cleanUrl = normalizeTargetUrl(targetUrl);
+	const urls = [];
+
+	// 1. 直连源站 (Cloudflare 全球骨干网络可极速直连 GitHub)
+	urls.push(cleanUrl);
+
+	// 2. 自定义镜像（若指定了非 worker / 非 direct 的 http(s) 前缀）
+	if (customMirror && customMirror.startsWith('http')) {
+		let prefix = customMirror.trim();
+		if (!prefix.endsWith('/')) prefix += '/';
+		const customUrl = `${prefix}${cleanUrl}`;
+		if (!urls.includes(customUrl)) {
+			urls.push(customUrl);
+		}
+	}
+
+	const isGithub = cleanUrl.startsWith('https://raw.githubusercontent.com/') ||
+		cleanUrl.startsWith('http://raw.githubusercontent.com/') ||
+		(cleanUrl.startsWith('https://github.com/') && cleanUrl.includes('/raw/'));
+
+	if (isGithub) {
+		// 3. 权威高可用公共镜像容灾池（依稳定性排序）
+		const stableMirrors = [
+			'https://gh-proxy.com/',
+			'https://ghfast.top/',
+			'https://ghproxy.net/'
+		];
+		for (const m of stableMirrors) {
+			const u = `${m}${cleanUrl}`;
+			if (!urls.includes(u)) urls.push(u);
+		}
+
+		// 4. raw.gitmirror.com 域名替换镜像
+		if (cleanUrl.includes('raw.githubusercontent.com')) {
+			const gitMirrorUrl = cleanUrl.replace('raw.githubusercontent.com', 'raw.gitmirror.com');
+			if (!urls.includes(gitMirrorUrl)) urls.push(gitMirrorUrl);
+		}
+	}
+
+	return urls;
+}
+
+// 内存级规则缓存 (24小时生命周期，针对单实例及非 Worker 运行环境)
+const ruleMemoryCache = new Map();
+
+export async function handleRuleProxyRequest(request, targetUrl, env = {}) {
+	const cleanUrl = normalizeTargetUrl(targetUrl);
+	if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+		return new Response("Invalid target URL protocol", { status: 400 });
+	}
+
+	const now = Date.now();
+	// 1. 优先检查内存缓存
+	const memCached = ruleMemoryCache.get(cleanUrl);
+	if (memCached && (now - memCached.time < 86400000)) {
+		const headers = new Headers();
+		headers.set('Content-Type', 'text/yaml; charset=utf-8');
+		headers.set('Cache-Control', 'public, max-age=86400');
+		headers.set('Access-Control-Allow-Origin', '*');
+		headers.set('X-Cache-Status', 'HIT-MEMORY');
+		return new Response(memCached.text, { status: 200, headers });
+	}
+
+	// 2. Cloudflare Edge 边缘缓存 (caches.default)
+	const cacheKey = new Request(cleanUrl, { method: 'GET' });
+	let cache = null;
+	try {
+		if (typeof caches !== 'undefined' && caches.default) {
+			cache = caches.default;
+			const cachedResponse = await cache.match(cacheKey);
+			if (cachedResponse) {
+				return cachedResponse;
+			}
+		}
+	} catch (e) {
+		console.warn('Edge cache match error:', e);
+	}
+
+	// 3. 多源容灾候选池依次遍历，单点镜像失效自动无缝回退
+	const candidates = getFailoverUrls(cleanUrl);
+	for (const cand of candidates) {
+		try {
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 4000);
+			const resp = await fetch(cand, {
+				signal: controller.signal,
+				headers: {
+					'User-Agent': 'Mozilla/5.0 (compatible; Clash/Mihomo; CF-Workers-SUB)'
+				}
+			});
+			clearTimeout(timeout);
+			if (resp.ok) {
+				const text = await resp.text();
+				if (text && text.trim().length > 0) {
+					// 写入内存缓存 (控制缓存上限 200 条防止内存膨胀)
+					if (ruleMemoryCache.size > 200) {
+						const firstKey = ruleMemoryCache.keys().next().value;
+						ruleMemoryCache.delete(firstKey);
+					}
+					ruleMemoryCache.set(cleanUrl, { text, time: now });
+
+					const headers = new Headers();
+					headers.set('Content-Type', 'text/yaml; charset=utf-8');
+					headers.set('Cache-Control', 'public, max-age=86400');
+					headers.set('Access-Control-Allow-Origin', '*');
+					headers.set('X-Relay-Source', cand);
+					headers.set('X-Cache-Status', 'MISS');
+
+					const response = new Response(text, { status: 200, headers });
+					if (cache) {
+						try {
+							await cache.put(cacheKey, response.clone());
+						} catch (cacheErr) {
+							console.warn('Edge cache put error:', cacheErr);
+						}
+					}
+					return response;
+				}
+			}
+		} catch (err) {
+			console.warn(`Fetch candidate ${cand} failed: ${err.message}`);
+		}
+	}
+
+	return new Response(`Error: Failed to fetch rule provider from all mirror sources.\nTarget: ${cleanUrl}`, {
+		status: 502,
+		headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+	});
+}
+
+export function applyGhProxy(url, ghProxy = 'worker', workerRuleBase = '') {
+	if (!url) return url;
+	const cleanUrl = normalizeTargetUrl(url);
+
+	// 直连或关闭加速
+	if (!ghProxy || ghProxy === 'direct' || ghProxy === 'false' || ghProxy === 'none' || ghProxy === 'off') {
+		return cleanUrl;
+	}
+
+	const isGithub = cleanUrl.startsWith('https://raw.githubusercontent.com/') ||
+		cleanUrl.startsWith('http://raw.githubusercontent.com/') ||
+		(cleanUrl.startsWith('https://github.com/') && cleanUrl.includes('/raw/'));
+
+	if (!isGithub) {
+		return cleanUrl;
+	}
+
+	// Worker 边缘中继模式 (默认推荐，永不因第三方镜像单点故障断联)
+	if (ghProxy === 'worker' || ghProxy === 'relay' || ghProxy === 'edge') {
+		if (workerRuleBase) {
+			const sep = workerRuleBase.includes('?') ? '&' : '?';
+			return `${workerRuleBase}${sep}url=${encodeURIComponent(cleanUrl)}`;
+		}
+		// 无 workerRuleBase 上下文时回退至公共高可用镜像
+		return `https://gh-proxy.com/${cleanUrl}`;
+	}
+
+	// 第三方镜像前缀模式 (如 https://gh-proxy.com/ 或 https://ghproxy.net/)
+	let prefix = ghProxy.trim();
+	if (!prefix.endsWith('/')) prefix += '/';
+	return `${prefix}${cleanUrl}`;
+}
+
+export async function loadSubConfig(url, ghProxy = 'worker') {
 	if (!url) return null;
 	const now = Date.now();
 	const cached = subConfigCache.get(url);
@@ -991,36 +1199,24 @@ export async function loadSubConfig(url, ghProxy = 'https://ghproxy.net/') {
 		return cached.parsed;
 	}
 
-	try {
-		const controller = new AbortController();
-		const timeout = setTimeout(() => controller.abort(), 3500);
-		const res = await fetch(url, { signal: controller.signal });
-		clearTimeout(timeout);
-		if (res.ok) {
-			const text = await res.text();
-			const parsed = parseSubConfig(text);
-			subConfigCache.set(url, { parsed, time: now });
-			return parsed;
-		}
-	} catch (e) {
-		console.warn('Fetch subConfig directly failed for:', url, e.message);
-		// 备选尝试：通过 GitHub 加速代理拉取
+	// 使用多源容灾池拉取规则配置文件 (即使单一镜像宕机也能从容流转)
+	const candidates = getFailoverUrls(url, ghProxy && ghProxy.startsWith('http') ? ghProxy : '');
+	for (const cand of candidates) {
 		try {
-			const proxiedUrl = applyGhProxy(url, ghProxy);
-			if (proxiedUrl !== url) {
-				const controller2 = new AbortController();
-				const timeout2 = setTimeout(() => controller2.abort(), 4000);
-				const res2 = await fetch(proxiedUrl, { signal: controller2.signal });
-				clearTimeout(timeout2);
-				if (res2.ok) {
-					const text2 = await res2.text();
-					const parsed2 = parseSubConfig(text2);
-					subConfigCache.set(url, { parsed: parsed2, time: now });
-					return parsed2;
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 3500);
+			const res = await fetch(cand, { signal: controller.signal });
+			clearTimeout(timeout);
+			if (res.ok) {
+				const text = await res.text();
+				if (text && text.trim().length > 0) {
+					const parsed = parseSubConfig(text);
+					subConfigCache.set(url, { parsed, time: now });
+					return parsed;
 				}
 			}
-		} catch (e2) {
-			console.error('Fallback fetch subConfig via ghProxy failed:', e2.message);
+		} catch (e) {
+			console.warn(`Fetch subConfig candidate ${cand} failed:`, e.message);
 		}
 	}
 
@@ -1305,7 +1501,7 @@ export function extractRuleProviderName(url, idx, seenNames) {
 	}
 }
 
-export function generateClashConfig(nodes, subName = 'CF-Workers-SUB', subConfigParsed = null, ghProxy = 'https://ghproxy.net/') {
+export function generateClashConfig(nodes, subName = 'CF-Workers-SUB', subConfigParsed = null, ghProxy = 'worker', workerRuleBase = '') {
 	const proxyNames = nodes.map(n => n.name);
 
 	let yaml = `# ${subName} Clash / Mihomo Configuration
@@ -1564,12 +1760,12 @@ proxies:
 	yaml += `\nproxy-groups:\n`;
 	yaml += builtGroups.map(formatProxyGroupYaml).join('\n\n') + '\n';
 
-	// 5. Rule-providers (根据 rule 文件名命名，并支持 GitHub 镜像加速)
+	// 5. Rule-providers (根据 rule 文件名命名，支持 Worker 边缘中继与 GitHub 镜像加速)
 	const seenProviderNames = new Set();
 	const providerEntries = rulesets.map((r, idx) => ({
 		name: extractRuleProviderName(r.url, idx, seenProviderNames),
 		group: r.group,
-		url: applyGhProxy(r.url, ghProxy),
+		url: applyGhProxy(r.url, ghProxy, workerRuleBase),
 		interval: r.interval || 86400
 	}));
 
@@ -1906,7 +2102,7 @@ async function 迁移地址列表(env, txt = 'LINK.txt') {
 // 8. KV 网页管理界面
 // ==========================================
 
-async function renderKVPage(request, env, txt = 'LINK.txt', guest, currentSubConfig) {
+async function renderKVPage(request, env, txt = 'LINK.txt', guest, currentSubConfig, currentGhProxy = 'worker') {
 	const url = new URL(request.url);
 
 	if (request.method === "POST") {
@@ -1918,6 +2114,7 @@ async function renderKVPage(request, env, txt = 'LINK.txt', guest, currentSubCon
 					const data = JSON.parse(body);
 					if (data.link !== undefined) await env.KV.put(txt, data.link);
 					if (data.subConfig !== undefined) await env.KV.put('CONFIG.txt', data.subConfig.trim());
+					if (data.ghProxy !== undefined) await env.KV.put('GHPROXY.txt', data.ghProxy.trim());
 					return new Response("保存成功");
 				} catch {}
 			}
@@ -2569,6 +2766,30 @@ async function renderKVPage(request, env, txt = 'LINK.txt', guest, currentSubCon
 		</div>
 	</section>
 
+	<!-- GHPROXY Acceleration Section -->
+	<section class="card">
+		<div class="card-header">
+			<h2 class="card-title">🚀 规则集加速与容灾中继 (GHPROXY)</h2>
+			<span class="badge badge-success" id="ghProxyBadge">● 多源容灾保护</span>
+		</div>
+		<div class="form-group">
+			<label class="form-label">加速策略模式：</label>
+			<select class="input-select" id="ghProxySelect" onchange="onGhProxySelectChange(this.value)">
+				<option value="worker">⚡ Worker 边缘中继与多源容灾池 (推荐，绝不断连，多源自动故障转移与边缘缓存)</option>
+				<option value="https://gh-proxy.com/">🌐 gh-proxy.com 公共镜像</option>
+				<option value="https://ghfast.top/">🌐 ghfast.top 备用镜像</option>
+				<option value="https://ghproxy.net/">🌐 ghproxy.net 传统镜像</option>
+				<option value="direct">🚫 直连 GitHub (无代理)</option>
+				<option value="custom">🛠️ 自定义镜像前缀...</option>
+			</select>
+			<div class="form-desc">彻底解决单一第三方镜像（如 ghproxy.net）宕机导致 Clash 规则集下载失败问题。推荐 Worker 边缘中继模式：由 Cloudflare 全球边缘节点直连 GitHub，自动尝试多源镜像容灾池并缓存 24 小时。</div>
+		</div>
+		<div class="form-group" id="customGhProxyGroup" style="display:none;">
+			<label class="form-label" for="ghProxyInput">自定义镜像/中继前缀：</label>
+			<input type="text" id="ghProxyInput" class="input-text" value="${currentGhProxy}" placeholder="例如: https://gh-proxy.com/" />
+		</div>
+	</section>
+
 	<!-- Content Management Card -->
 	<section class="card">
 		<div class="card-header">
@@ -2703,12 +2924,57 @@ function clearEditor() {
 	}
 }
 
+function onGhProxySelectChange(val) {
+	const customGroup = document.getElementById('customGhProxyGroup');
+	const input = document.getElementById('ghProxyInput');
+	const badge = document.getElementById('ghProxyBadge');
+	if (val === 'custom') {
+		customGroup.style.display = 'block';
+		badge.textContent = '● 自定义代理';
+		badge.className = 'badge badge-primary';
+	} else {
+		customGroup.style.display = 'none';
+		input.value = val;
+		if (val === 'worker') {
+			badge.textContent = '● 多源容灾保护';
+			badge.className = 'badge badge-success';
+		} else if (val === 'direct') {
+			badge.textContent = '● 直连模式';
+			badge.className = 'badge';
+		} else {
+			badge.textContent = '● 镜像加速';
+			badge.className = 'badge badge-primary';
+		}
+	}
+}
+
+(function initGhProxy() {
+	const current = ${JSON.stringify(currentGhProxy)};
+	const select = document.getElementById('ghProxySelect');
+	const input = document.getElementById('ghProxyInput');
+	input.value = current;
+	let matched = false;
+	for (let opt of select.options) {
+		if (opt.value === current) {
+			select.value = current;
+			matched = true;
+			break;
+		}
+	}
+	if (!matched) {
+		select.value = 'custom';
+		document.getElementById('customGhProxyGroup').style.display = 'block';
+	}
+	onGhProxySelectChange(select.value);
+})();
+
 function saveData() {
 	const btn = document.getElementById('saveBtn');
 	const btnText = document.getElementById('saveBtnText');
 	const statusElem = document.getElementById('saveStatus');
 	const linkVal = document.getElementById('content').value;
 	const subConfigVal = document.getElementById('subConfigInput').value.trim();
+	const ghProxyVal = document.getElementById('ghProxyInput').value.trim() || 'worker';
 
 	btn.disabled = true;
 	btnText.textContent = '⏳ 保存中...';
@@ -2716,7 +2982,8 @@ function saveData() {
 
 	const payload = {
 		link: linkVal,
-		subConfig: subConfigVal
+		subConfig: subConfigVal,
+		ghProxy: ghProxyVal
 	};
 
 	fetch(window.location.href, {
