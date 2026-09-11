@@ -354,7 +354,7 @@ export function parseVmess(rawUri, envScv = false) {
 		if (item.aid !== undefined && item.aid !== null && item.aid !== '') {
 			proxy.alterId = parseInt(item.aid, 10);
 		}
-		if (item.scy) proxy.cipher = item.scy;
+		proxy.cipher = item.scy || 'auto';
 		if (item.udp !== undefined) {
 			proxy.udp = item.udp === true || item.udp === 'true' || item.udp === '1';
 		}
@@ -899,7 +899,7 @@ function mapDictToProxy(dict) {
 	if (type === 'vmess') {
 		proxy.uuid = dict.uuid;
 		if (dict.alterId !== undefined) proxy.alterId = parseInt(dict.alterId, 10);
-		if (dict.cipher) proxy.cipher = dict.cipher;
+		proxy.cipher = dict.cipher || 'auto';
 	} else if (type === 'vless') {
 		proxy.uuid = dict.uuid;
 		if (dict.flow) proxy.flow = dict.flow;
@@ -1434,7 +1434,7 @@ export function proxyToClashYaml(p) {
 	if (p.type === 'vmess') {
 		lines.push(`    uuid: ${JSON.stringify(p.uuid)}`);
 		if (p.alterId !== undefined) lines.push(`    alterId: ${p.alterId}`);
-		if (p.cipher) lines.push(`    cipher: ${p.cipher}`);
+		lines.push(`    cipher: ${p.cipher || 'auto'}`);
 		if (p.tls) {
 			lines.push(`    tls: true`);
 			if (p.sni) lines.push(`    servername: ${JSON.stringify(p.sni)}`);

@@ -12,6 +12,7 @@ import worker, {
     nodeToUri,
     processNodes,
     generateClashConfig,
+    proxyToClashYaml,
     generateBase64Config,
     parseClashProxies,
     parseSubConfig,
@@ -91,7 +92,11 @@ test('Parse VMess node: strict parameter fidelity', () => {
     assert.equal(node.port, 8443);
     assert.equal(node.uuid, '03fcc618-b93d-6796-6aed-8a38c975d581');
     assert.equal(node.network, 'ws');
+    assert.equal(node.cipher, 'auto'); // Default to auto when scy is omitted
     assert.equal(node.clientFingerprint, undefined); // No forced default
+
+    const yaml = proxyToClashYaml(node);
+    assert.ok(yaml.includes('cipher: auto'), 'Clash YAML must have cipher: auto for VMess');
 });
 
 test('Parse Trojan node: strict parameter fidelity', () => {
