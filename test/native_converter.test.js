@@ -26,7 +26,12 @@ import worker, {
     handleRuleProxyRequest,
     cleanTextRuleList,
     isYamlRulePayload,
-    convertRuleListToYaml
+    convertRuleListToYaml,
+    parseYaml,
+    dumpYaml,
+    deepMerge,
+    applyYamlOverride,
+    loadOverrideConfig
 } from '../_worker.js';
 
 test('Extract rule provider name from URL and deduplicate', () => {
@@ -681,3 +686,281 @@ IP-CIDR,127.0.0.0/8,no-resolve
     assert.ok(yamlOutput.includes('- "DOMAIN-KEYWORD,anthropic"'));
     assert.ok(yamlOutput.includes('- "IP-CIDR,127.0.0.0/8,no-resolve"'));
 });
+
+test('YAML parser (parseYaml) handles primitives, lists, maps, quotes and comments', () => {
+    const yamlStr = `
+# Global comment
+port: 7890
+socks-port: 7891
+mode: rule # Inline mode
+ipv6: false
+log-level: info
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+    - https://1.1.1.1/dns-query#RULES
+  fallback: []
+  nameserver-policy:
+    "geosite:cn,private": [223.5.5.5, 119.29.29.29]
+proxies:
+  - name: "Node-1"
+    type: trojan
+    server: 1.2.3.4
+    port: 443
+rules:
+  - DOMAIN-SUFFIX,google.com,节点选择
+  - MATCH,漏网之鱼
+`;
+
+    const parsed = parseYaml(yamlStr);
+    assert.equal(parsed.port, 7890);
+    assert.equal(parsed['socks-port'], 7891);
+    assert.equal(parsed.mode, 'rule');
+    assert.equal(parsed.ipv6, false);
+    assert.equal(parsed['log-level'], 'info');
+
+    assert.ok(parsed.dns);
+    assert.equal(parsed.dns.enable, true);
+    assert.equal(parsed.dns['enhanced-mode'], 'fake-ip');
+    assert.equal(parsed.dns['fake-ip-range'], '198.18.0.1/16');
+    assert.deepEqual(parsed.dns.fallback, []);
+    assert.equal(parsed.dns.nameserver.length, 3);
+    assert.equal(parsed.dns.nameserver[2], 'https://1.1.1.1/dns-query#RULES');
+
+    assert.ok(parsed.dns['nameserver-policy']['geosite:cn,private']);
+    assert.equal(parsed.dns['nameserver-policy']['geosite:cn,private'].length, 2);
+
+    assert.equal(parsed.proxies.length, 1);
+    assert.equal(parsed.proxies[0].name, 'Node-1');
+    assert.equal(parsed.proxies[0].type, 'trojan');
+    assert.equal(parsed.proxies[0].server, '1.2.3.4');
+    assert.equal(parsed.proxies[0].port, 443);
+
+    assert.equal(parsed.rules.length, 2);
+    assert.equal(parsed.rules[0], 'DOMAIN-SUFFIX,google.com,节点选择');
+    assert.equal(parsed.rules[1], 'MATCH,漏网之鱼');
+});
+
+test('Clash Party deepMerge override semantics (+rules prepend, rules+ append, key! replace, recursive merge)', () => {
+    const target = {
+        dns: {
+            enable: false,
+            'enhanced-mode': 'redir-host',
+            nameserver: ['114.114.114.114']
+        },
+        rules: [
+            'GEOIP,CN,DIRECT',
+            'MATCH,漏网之鱼'
+        ],
+        tun: {
+            enable: false,
+            stack: 'gvisor'
+        }
+    };
+
+    const override = {
+        dns: {
+            enable: true,
+            'enhanced-mode': 'fake-ip',
+            fallback: []
+        },
+        '+rules': [
+            'DOMAIN-SUFFIX,linux.do,全球直连',
+            'DOMAIN-KEYWORD,openai,节点选择'
+        ],
+        'tun!': {
+            enable: true,
+            stack: 'mixed',
+            'auto-route': true
+        }
+    };
+
+    const merged = deepMerge(target, override, true);
+
+    // 1. Recursive merge for dns
+    assert.equal(merged.dns.enable, true);
+    assert.equal(merged.dns['enhanced-mode'], 'fake-ip');
+    assert.deepEqual(merged.dns.nameserver, ['114.114.114.114']);
+    assert.deepEqual(merged.dns.fallback, []);
+
+    // 2. Prepend array for +rules
+    assert.equal(merged.rules.length, 4);
+    assert.equal(merged.rules[0], 'DOMAIN-SUFFIX,linux.do,全球直连');
+    assert.equal(merged.rules[1], 'DOMAIN-KEYWORD,openai,节点选择');
+    assert.equal(merged.rules[2], 'GEOIP,CN,DIRECT');
+    assert.equal(merged.rules[3], 'MATCH,漏网之鱼');
+
+    // 3. Force replacement for tun!
+    assert.equal(merged.tun.enable, true);
+    assert.equal(merged.tun.stack, 'mixed');
+    assert.equal(merged.tun['auto-route'], true);
+
+    // 4. Test rules+ append
+    const appendOverride = {
+        'rules+': ['FINAL,漏网之鱼,no-resolve']
+    };
+    deepMerge(merged, appendOverride, true);
+    assert.equal(merged.rules.length, 5);
+    assert.equal(merged.rules[4], 'FINAL,漏网之鱼,no-resolve');
+});
+
+test('dumpYaml generates valid YAML string formatting', () => {
+    const obj = {
+        port: 7890,
+        mode: 'rule',
+        ipv6: false,
+        dns: {
+            enable: true,
+            nameserver: [
+                '223.5.5.5',
+                'https://1.1.1.1/dns-query#RULES'
+            ]
+        },
+        proxies: [
+            {
+                name: 'Test Node',
+                type: 'ss',
+                server: '1.2.3.4',
+                port: 8388
+            }
+        ]
+    };
+
+    const yamlStr = dumpYaml(obj);
+    assert.ok(yamlStr.includes('port: 7890'));
+    assert.ok(yamlStr.includes('mode: rule'));
+    assert.ok(yamlStr.includes('ipv6: false'));
+    assert.ok(yamlStr.includes('dns:'));
+    assert.ok(yamlStr.includes('  enable: true'));
+    assert.ok(yamlStr.includes('  nameserver:'));
+    assert.ok(yamlStr.includes('    - 223.5.5.5'));
+    assert.ok(yamlStr.includes('    - "https://1.1.1.1/dns-query#RULES"'));
+    assert.ok(yamlStr.includes('proxies:'));
+    assert.ok(yamlStr.includes('  - name: Test Node'));
+    assert.ok(yamlStr.includes('    type: ss'));
+});
+
+test('applyYamlOverride merges base Clash YAML and override YAML seamlessly', () => {
+    const baseYaml = `
+port: 7890
+socks-port: 7891
+mode: rule
+dns:
+  enable: true
+  nameserver:
+    - 223.5.5.5
+rules:
+  - GEOIP,CN,DIRECT
+  - MATCH,漏网之鱼
+`;
+
+    const overrideYaml = `
+dns:
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fallback: []
+tun:
+  enable: true
+  stack: mixed
++rules:
+  - DOMAIN-SUFFIX,linux.do,全球直连
+`;
+
+    const result = applyYamlOverride(baseYaml, overrideYaml);
+    assert.ok(result.includes('port: 7890'));
+    assert.ok(result.includes('enhanced-mode: fake-ip'));
+    assert.ok(result.includes('fake-ip-range: 198.18.0.1/16'));
+    assert.ok(result.includes('fallback: []'));
+    assert.ok(result.includes('tun:'));
+    assert.ok(result.includes('  enable: true'));
+    assert.ok(result.includes('  stack: mixed'));
+
+    // Check rules order: prepended rule must precede existing rules
+    const idxPrepend = result.indexOf('DOMAIN-SUFFIX,linux.do,全球直连');
+    const idxCn = result.indexOf('GEOIP,CN,DIRECT');
+    const idxMatch = result.indexOf('MATCH,漏网之鱼');
+    assert.ok(idxPrepend !== -1, 'Prepend rule must be present');
+    assert.ok(idxCn !== -1, 'Original rule must be present');
+    assert.ok(idxPrepend < idxCn, 'Prepend rule must come BEFORE original rules');
+    assert.ok(idxCn < idxMatch, 'MATCH must follow GEOIP');
+});
+
+test('Web UI includes OVERRIDE settings and persists OVERRIDE.txt to KV', async () => {
+    const kvStore = new Map();
+    const mockEnv = {
+        TOKEN: 'mytesttoken',
+        KV: {
+            get: async (k) => kvStore.get(k) || null,
+            put: async (k, v) => kvStore.set(k, v)
+        }
+    };
+
+    // 1. GET 网页端渲染 -> 包含 OVERRIDE 卡片和预设
+    const reqGet = new Request('https://mysub.workers.dev/mytesttoken', {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+    });
+    const resGet = await worker.fetch(reqGet, mockEnv);
+    const pageHtml = await resGet.text();
+    assert.ok(pageHtml.includes('Clash YAML 覆写配置 (OVERRIDE)'), '页面必须包含 OVERRIDE 配置卡片');
+    assert.ok(pageHtml.includes('overrideInput'), '页面必须包含 overrideInput 输入框');
+    assert.ok(pageHtml.includes('applyOverridePreset'), '页面必须包含 applyOverridePreset 预设切换函数');
+
+    // 2. POST 保存 OVERRIDE 配置 -> 写入 KV OVERRIDE.txt
+    const savePayload = {
+        link: 'trojan://p@1.1.1.1:443#Test',
+        subConfig: 'https://raw.githubusercontent.com/test/my.ini',
+        ghProxy: 'worker',
+        override: 'https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/override.yaml'
+    };
+    const resSave = await worker.fetch(new Request('https://mysub.workers.dev/mytesttoken', {
+        method: 'POST',
+        body: JSON.stringify(savePayload),
+        headers: { 'Content-Type': 'application/json' }
+    }), mockEnv);
+    assert.equal(resSave.status, 200);
+    assert.equal(kvStore.get('OVERRIDE.txt'), 'https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/override.yaml');
+});
+
+test('Worker fetch endpoint handles ?override= query and ?override=none correctly', async () => {
+    const mockEnv = {
+        TOKEN: 'mytesttoken',
+        LINK: 'trojan://password@1.1.1.1:443#HK-Trojan',
+        OVERRIDE: 'none' // 禁用全局覆盖以便测试独立参数
+    };
+
+    // 1. 请求无覆写 (OVERRIDE=none)
+    const reqNoOv = new Request('https://mysub.workers.dev/mytesttoken?clash', {
+        headers: { 'User-Agent': 'clash-verge/v1.0' }
+    });
+    const resNoOv = await worker.fetch(reqNoOv, mockEnv);
+    assert.equal(resNoOv.status, 200);
+    const yamlNoOv = await resNoOv.text();
+    assert.ok(!yamlNoOv.includes('custom-test.com'), '未启用覆写时不包含 override 特有规则');
+    assert.ok(!yamlNoOv.includes('stack: mixed'), '未启用覆写时不包含 override 特有 tun 配置');
+    assert.ok(!yamlNoOv.includes('fallback: []'), '未启用覆写时不包含 override 特有清空 fallback');
+
+    // 2. 请求带嵌入式或自包含 override (如自定义 DNS 与 TUN)
+    const customOverrideText = `
+dns:
+  fallback: []
+tun:
+  enable: true
+  stack: mixed
++rules:
+  - DOMAIN-SUFFIX,custom-test.com,全球直连
+`;
+    const reqWithOv = new Request(`https://mysub.workers.dev/mytesttoken?clash&override=${encodeURIComponent(customOverrideText)}`, {
+        headers: { 'User-Agent': 'clash-verge/v1.0' }
+    });
+    const resWithOv = await worker.fetch(reqWithOv, mockEnv);
+    assert.equal(resWithOv.status, 200);
+    const yamlWithOv = await resWithOv.text();
+    assert.ok(yamlWithOv.includes('fallback: []'), '生效覆写后包含 fallback: []');
+    assert.ok(yamlWithOv.includes('stack: mixed'), '生效覆写后包含 tun stack: mixed');
+    assert.ok(yamlWithOv.includes('DOMAIN-SUFFIX,custom-test.com,全球直连'), '生效覆写后包含 +rules 前置规则');
+});
+

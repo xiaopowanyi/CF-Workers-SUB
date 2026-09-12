@@ -17,14 +17,18 @@
    - **支持自定义规则配置文件 (SUBCONFIG)**：支持在后台管理页面自由选择预设或填写任何远程 `.ini` 规则集链接（如 `my.ini` 或 ACL4SSR 系列），自动生成对应的 `rule-providers` 与分流规则。
 2. **原生 Base64 订阅生成：**
    - 将所有汇聚的自建节点和远程订阅解码后重新整合成纯净的 Base64 订阅链接，兼容 v2rayN、v2rayNG、Shadowrocket、NekoBox 等。
-3. **真实节点参数保真（不预设多余默认值）：**
+3. **服务端 Clash YAML 覆写引擎（基于 Clash Party 深度合并规范）：**
+   - **一处配置，全端生效**：无需在每台手机、电脑客户端上手动配置覆写，直接在服务端生成订阅时完成深度合并！
+   - 完全遵循 Clash Party 语义规范：支持 `+rules`（前置优先规则）、`rules+`（追加兜底规则）、`key!`（强制替换对象）、递归合并对象属性与清空数组（如 `fallback: []` 彻底防 DNS 泄露）。
+   - 支持通过后台管理面板、KV (`OVERRIDE.txt`)、环境变量 (`OVERRIDE`) 或 URL 参数 (`?override=` / `?ov=`) 灵活配置与即时切换。
+4. **真实节点参数保真（不预设多余默认值）：**
    - 严格根据节点链接填写的参数生成配置，不强制注入 `client-fingerprint`、`skip-cert-verify` 等默认字段，把控制权还给客户端自行处理默认策略。
    - 支持通过 `SCV` 环境变量控制证书验证全局策略。
-4. **多格式与多协议深度支持：**
+5. **多格式与多协议深度支持：**
    - 协议支持：VLESS（含 Reality / XTLS / WS / gRPC）、VMess、Trojan、Shadowsocks (SS)、ShadowsocksR (SSR)、Hysteria 2 (Hy2)、TUIC 等。
    - 订阅聚合：支持聚合明文节点、Base64 订阅，以及**直接从远程 Clash YAML 订阅中提取 proxies 节点**。
-5. **便捷的 Web 可视化管理面板：**
-   - 绑定 KV 后，访问 `/auto`（或自定义 TOKEN）即可进入管理面板，在线编辑保存节点列表与 SUBCONFIG 规则链接，并自动生成快捷二维码。
+6. **便捷的 Web 可视化管理面板：**
+   - 绑定 KV 后，访问 `/auto`（或自定义 TOKEN）即可进入管理面板，在线编辑保存节点列表、SUBCONFIG 规则集、GHPROXY 镜像中继与 OVERRIDE 覆写配置，并自动生成快捷二维码。
 
 ---
 
@@ -52,6 +56,8 @@
 | `TOKEN` | `auto` | ✅ | 快速订阅与后台管理的访问凭证，例如 `/auto` | 
 | `GUEST` / `GUESTTOKEN` | `visitor123` | ❌ | 访客订阅凭证，只允许获取订阅，无法查看与编辑后台配置 | 
 | `SUBCONFIG` | `https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/my.ini` | ❌ | Clash 规则集配置文件链接（也可直接在 Web 后台在线填写保存） |
+| `OVERRIDE` | `https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/override.yaml` | ❌ | Clash YAML 覆写文件链接或 YAML 文本（遵循 Clash Party 规范，也可在 Web 后台保存或设为 `none` 禁用） |
+| `GHPROXY` | `worker` | ❌ | 规则集加速模式：`worker`（默认多源容灾）、`direct`（直连）、或镜像前缀 |
 | `LINK` | `vless://... \n vmess://...` | ❌ | 节点链接与订阅链接列表（未绑定 KV 时使用环境变量作为数据源） |
 | `LINKSUB` | `https://sub1.com \n https://sub2.com` | ❌ | 远程订阅链接列表 |
 | `SUBNAME` | `CF-Workers-SUB` | ❌ | 导出的订阅与文件名称 |
@@ -67,4 +73,6 @@
 - **自适应订阅（推荐）**：`https://你的域名/auto`（自动根据客户端 UA 返回 Clash 配置或 Base64 订阅）
 - **强制 Clash 订阅**：`https://你的域名/auto?clash`
 - **强制 Base64 订阅**：`https://你的域名/auto?b64`
-- **临时指定规则配置**：`https://你的域名/auto?clash&config=https://.../custom.ini`
+- **指定规则配置**：`https://你的域名/auto?clash&config=https://.../custom.ini`
+- **指定/切换覆写配置**：`https://你的域名/auto?clash&override=https://.../override.yaml`（简写 `&ov=...`）
+- **临时禁用覆写**：`https://你的域名/auto?clash&override=none`

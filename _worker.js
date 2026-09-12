@@ -27,6 +27,12 @@ let subConfig = "https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/m
 // SUBCONFIG 缓存 (URL -> { parsed, time })
 const subConfigCache = new Map();
 
+// 默认 Clash 覆写配置文件 (支持环境变量 OVERRIDE 覆盖，或前端管理页面填写保存至 KV)
+let defaultOverride = "https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/override.yaml";
+
+// OVERRIDE 缓存 (URL -> { text, time })
+const overrideConfigCache = new Map();
+
 export default {
 	async fetch(request, env) {
 		const userAgentHeader = request.headers.get('User-Agent') || '';
@@ -107,12 +113,21 @@ export default {
 			currentGhProxy = env.GH_PROXY || env.GHPROXY || 'worker';
 		}
 
+		// 解析当前生效的 OVERRIDE (优先级: URL参数 ?override= / ?ov= > KV 中保存的 OVERRIDE.txt > 环境变量 OVERRIDE > 默认 defaultOverride)
+		let currentOverride = url.searchParams.get('override') ?? url.searchParams.get('ov');
+		if (currentOverride === null && env.KV) {
+			currentOverride = await env.KV.get('OVERRIDE.txt');
+		}
+		if (currentOverride === null || currentOverride === undefined) {
+			currentOverride = (env.OVERRIDE !== undefined) ? env.OVERRIDE : defaultOverride;
+		}
+
 		// KV 管理页面与数据加载
 		if (env.KV) {
 			await 迁移地址列表(env, 'LINK.txt');
 			if ((request.method === "POST" || userAgent.includes('mozilla')) && !url.search && url.pathname !== '/sub') {
 				await sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}\n域名: ${url.hostname}\n入口: ${url.pathname + url.search}`);
-				return await renderKVPage(request, env, 'LINK.txt', 访客订阅, currentSubConfig, currentGhProxy);
+				return await renderKVPage(request, env, 'LINK.txt', 访客订阅, currentSubConfig, currentGhProxy, currentOverride);
 			} else {
 				MainData = await env.KV.get('LINK.txt') || MainData;
 			}
@@ -208,7 +223,25 @@ export default {
 
 			// 根据当前选择或配置的 SUBCONFIG 解析规则与分组
 			const subConfigParsed = await loadSubConfig(currentSubConfig, currentGhProxy);
-			const clashYaml = generateClashConfig(allNodes, FileName, subConfigParsed, currentGhProxy, workerRuleBase);
+			let clashYaml = generateClashConfig(allNodes, FileName, subConfigParsed, currentGhProxy, workerRuleBase);
+
+			// 应用 Clash YAML 覆写配置 (OVERRIDE)
+			const shouldApplyOverride = currentOverride &&
+				currentOverride.trim() &&
+				currentOverride.trim().toLowerCase() !== 'none' &&
+				currentOverride.trim().toLowerCase() !== 'off' &&
+				currentOverride.trim().toLowerCase() !== 'false';
+			if (shouldApplyOverride) {
+				try {
+					const overrideYaml = await loadOverrideConfig(currentOverride, currentGhProxy);
+					if (overrideYaml) {
+						clashYaml = applyYamlOverride(clashYaml, overrideYaml);
+					}
+				} catch (err) {
+					console.error('Failed to apply YAML override:', err);
+				}
+			}
+
 			return new Response(clashYaml, { headers: responseHeaders });
 		} else {
 			responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
@@ -1911,7 +1944,347 @@ export function generateBase64Config(nodes) {
 }
 
 // ==========================================
-// 7. 辅助功能函数与网络请求
+// 7. Clash YAML 覆写引擎 (Clash Party 规范深度合并)
+// ==========================================
+
+function splitKeyVal(line) {
+	let inSingle = false, inDouble = false;
+	for (let i = 0; i < line.length; i++) {
+		const ch = line[i];
+		if (ch === "'" && !inDouble) inSingle = !inSingle;
+		else if (ch === '"' && !inSingle) inDouble = !inDouble;
+		else if (ch === ':' && !inSingle && !inDouble) {
+			return [line.slice(0, i).trim(), line.slice(i + 1).trim()];
+		}
+	}
+	return [line.trim(), ''];
+}
+
+function parseYamlValue(val) {
+	val = val.trim();
+	if (val === 'true') return true;
+	if (val === 'false') return false;
+	if (val === 'null' || val === '~' || val === '') return null;
+	if (val === '{}') return {};
+	if (val.startsWith('[') && val.endsWith(']')) {
+		const inner = val.slice(1, -1).trim();
+		if (!inner) return [];
+		const items = [];
+		let current = '', inSingle = false, inDouble = false;
+		for (let i = 0; i < inner.length; i++) {
+			const ch = inner[i];
+			if (ch === "'" && !inDouble) inSingle = !inSingle;
+			else if (ch === '"' && !inSingle) inDouble = !inDouble;
+			else if (ch === ',' && !inSingle && !inDouble) {
+				items.push(parseYamlValue(current.trim()));
+				current = '';
+				continue;
+			}
+			current += ch;
+		}
+		if (current.trim()) items.push(parseYamlValue(current.trim()));
+		return items;
+	}
+	if (/^-?\d+$/.test(val)) return parseInt(val, 10);
+	if (/^-?\d+\.\d+$/.test(val)) return parseFloat(val);
+	if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+		return val.slice(1, -1);
+	}
+	return val;
+}
+
+export function parseYaml(yamlStr) {
+	if (!yamlStr) return {};
+	const rawLines = yamlStr.split('\n');
+	const lines = [];
+
+	for (let i = 0; i < rawLines.length; i++) {
+		let line = rawLines[i];
+		let inSingle = false, inDouble = false, commentIdx = -1;
+		for (let j = 0; j < line.length; j++) {
+			const ch = line[j];
+			if (ch === "'" && !inDouble) inSingle = !inSingle;
+			else if (ch === '"' && !inSingle) inDouble = !inDouble;
+			else if (ch === '#' && !inSingle && !inDouble) {
+				if (j === 0 || /\s/.test(line[j - 1])) {
+					commentIdx = j;
+					break;
+				}
+			}
+		}
+		if (commentIdx !== -1) line = line.slice(0, commentIdx);
+		if (!line.trim()) continue;
+
+		const indent = line.search(/\S/);
+		lines.push({ indent, text: line.trim() });
+	}
+
+	let cursor = 0;
+
+	function parseBlock(currentIndent) {
+		if (cursor >= lines.length) return null;
+
+		const first = lines[cursor];
+		if (first.indent < currentIndent) return null;
+
+		if (first.text.startsWith('- ') || first.text === '-') {
+			const list = [];
+			const listIndent = first.indent;
+			while (cursor < lines.length && lines[cursor].indent === listIndent && (lines[cursor].text.startsWith('- ') || lines[cursor].text === '-')) {
+				const lineObj = lines[cursor];
+				cursor++;
+				const itemText = lineObj.text.slice(1).trim();
+
+				if (!itemText) {
+					if (cursor < lines.length && lines[cursor].indent > listIndent) {
+						list.push(parseBlock(lines[cursor].indent));
+					} else {
+						list.push(null);
+					}
+				} else if ((itemText.includes(': ') || itemText.endsWith(':')) && !itemText.startsWith('http://') && !itemText.startsWith('https://')) {
+					const [kRaw, vRaw] = splitKeyVal(itemText);
+					let k = kRaw;
+					if ((k.startsWith('"') && k.endsWith('"')) || (k.startsWith("'") && k.endsWith("'"))) {
+						k = k.slice(1, -1);
+					}
+					const obj = {};
+					if (vRaw) {
+						obj[k] = parseYamlValue(vRaw);
+					} else if (cursor < lines.length && lines[cursor].indent > listIndent) {
+						obj[k] = parseBlock(lines[cursor].indent);
+					} else {
+						obj[k] = null;
+					}
+
+					while (cursor < lines.length && lines[cursor].indent > listIndent && !lines[cursor].text.startsWith('- ')) {
+						const nextLine = lines[cursor];
+						const [nkRaw, nvRaw] = splitKeyVal(nextLine.text);
+						cursor++;
+						let nk = nkRaw;
+						if ((nk.startsWith('"') && nk.endsWith('"')) || (nk.startsWith("'") && nk.endsWith("'"))) {
+							nk = nk.slice(1, -1);
+						}
+						if (nvRaw) {
+							obj[nk] = parseYamlValue(nvRaw);
+						} else if (cursor < lines.length && lines[cursor].indent > nextLine.indent) {
+							obj[nk] = parseBlock(lines[cursor].indent);
+						} else {
+							obj[nk] = null;
+						}
+					}
+					list.push(obj);
+				} else {
+					list.push(parseYamlValue(itemText));
+				}
+			}
+			return list;
+		}
+
+		const map = {};
+		const mapIndent = first.indent;
+		while (cursor < lines.length && lines[cursor].indent === mapIndent) {
+			const lineObj = lines[cursor];
+			if (lineObj.text.startsWith('- ')) break;
+
+			const [keyRaw, valStr] = splitKeyVal(lineObj.text);
+			cursor++;
+			let key = keyRaw;
+			if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+				key = key.slice(1, -1);
+			}
+
+			if (valStr) {
+				map[key] = parseYamlValue(valStr);
+			} else {
+				if (cursor < lines.length && lines[cursor].indent > mapIndent) {
+					map[key] = parseBlock(lines[cursor].indent);
+				} else {
+					map[key] = null;
+				}
+			}
+		}
+		return map;
+	}
+
+	return parseBlock(0) || {};
+}
+
+function isObject(val) {
+	return val !== null && typeof val === 'object' && !Array.isArray(val);
+}
+
+export function deepMerge(target, other, isOverride = true) {
+	if (!target || !isObject(target)) target = {};
+	if (!other || !isObject(other)) return target;
+
+	for (const key in other) {
+		if (isObject(other[key])) {
+			if (key.endsWith('!')) {
+				const k = key.slice(0, -1).trim();
+				target[k] = other[key];
+			} else {
+				const k = key.trim();
+				if (!target[k] || !isObject(target[k])) target[k] = {};
+				deepMerge(target[k], other[key], isOverride);
+			}
+		} else if (Array.isArray(other[key])) {
+			if (isOverride && key.startsWith('+')) {
+				const k = key.slice(1).trim();
+				if (!target[k] || !Array.isArray(target[k])) target[k] = [];
+				target[k] = [...other[key], ...target[k]];
+			} else if (isOverride && key.endsWith('+')) {
+				const k = key.slice(0, -1).trim();
+				if (!target[k] || !Array.isArray(target[k])) target[k] = [];
+				target[k] = [...target[k], ...other[key]];
+			} else {
+				const k = key.trim();
+				target[k] = other[key];
+			}
+		} else {
+			target[key] = other[key];
+		}
+	}
+	return target;
+}
+
+function formatYamlKey(key) {
+	if (typeof key !== 'string') key = String(key);
+	if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+		return key;
+	}
+	if (key.includes(':') || key.includes(' ') || key.includes(',') || key.includes('#') || key.startsWith('-')) {
+		return JSON.stringify(key);
+	}
+	return key;
+}
+
+function formatYamlScalar(val) {
+	if (val === null || val === undefined) return '';
+	if (typeof val === 'boolean') return val ? 'true' : 'false';
+	if (typeof val === 'number') return String(val);
+	const str = String(val);
+	if (str === '') return '""';
+	if (str === 'true' || str === 'false' || str === 'null' || str === '~') return `"${str}"`;
+	if (str.includes('#') || str.includes(': ') || str.startsWith('- ') || str.startsWith('"') || str.startsWith("'")) {
+		return JSON.stringify(str);
+	}
+	return str;
+}
+
+export function dumpYaml(obj, indent = 0) {
+	if (!obj) return '';
+	const pad = ' '.repeat(indent);
+	let out = '';
+
+	if (Array.isArray(obj)) {
+		for (const item of obj) {
+			if (isObject(item)) {
+				const keys = Object.keys(item);
+				if (keys.length === 0) {
+					out += `${pad}- {}\n`;
+				} else {
+					const firstKey = keys[0];
+					const firstVal = item[firstKey];
+					const formattedFirstKey = formatYamlKey(firstKey);
+					if (isObject(firstVal) || Array.isArray(firstVal)) {
+						out += `${pad}- ${formattedFirstKey}:\n${dumpYaml(firstVal, indent + 4)}`;
+					} else {
+						out += `${pad}- ${formattedFirstKey}: ${formatYamlScalar(firstVal)}\n`;
+					}
+					for (let i = 1; i < keys.length; i++) {
+						const k = keys[i];
+						const v = item[k];
+						const formattedK = formatYamlKey(k);
+						if (isObject(v) || Array.isArray(v)) {
+							out += `${pad}  ${formattedK}:\n${dumpYaml(v, indent + 4)}`;
+						} else {
+							out += `${pad}  ${formattedK}: ${formatYamlScalar(v)}\n`;
+						}
+					}
+				}
+			} else if (Array.isArray(item)) {
+				out += `${pad}-\n${dumpYaml(item, indent + 2)}`;
+			} else {
+				out += `${pad}- ${formatYamlScalar(item)}\n`;
+			}
+		}
+	} else if (isObject(obj)) {
+		for (const [k, v] of Object.entries(obj)) {
+			const formattedKey = formatYamlKey(k);
+			if (isObject(v)) {
+				if (Object.keys(v).length === 0) {
+					out += `${pad}${formattedKey}: {}\n`;
+				} else {
+					out += `${pad}${formattedKey}:\n${dumpYaml(v, indent + 2)}`;
+				}
+			} else if (Array.isArray(v)) {
+				if (v.length === 0) {
+					out += `${pad}${formattedKey}: []\n`;
+				} else {
+					out += `${pad}${formattedKey}:\n${dumpYaml(v, indent + 2)}`;
+				}
+			} else {
+				out += `${pad}${formattedKey}: ${formatYamlScalar(v)}\n`;
+			}
+		}
+	}
+	return out;
+}
+
+export function applyYamlOverride(baseYaml, overrideYaml) {
+	if (!overrideYaml || !overrideYaml.trim()) return baseYaml;
+	try {
+		const baseObj = parseYaml(baseYaml);
+		const overrideObj = parseYaml(overrideYaml);
+		const mergedObj = deepMerge(baseObj, overrideObj, true);
+		return dumpYaml(mergedObj);
+	} catch (err) {
+		console.error('Error in applyYamlOverride:', err);
+		return baseYaml;
+	}
+}
+
+export async function loadOverrideConfig(source, ghProxy = 'worker') {
+	if (!source || !source.trim()) return null;
+	const cleanSource = source.trim();
+
+	// 如果直接是 YAML 文本内容（包含多行或关键字段结构）
+	if (cleanSource.includes('\n') || cleanSource.includes(': ') || cleanSource.includes(':\n')) {
+		return cleanSource;
+	}
+
+	const now = Date.now();
+	const cached = overrideConfigCache.get(cleanSource);
+	if (cached && (now - cached.time < 600000)) {
+		return cached.text;
+	}
+
+	if (cleanSource.startsWith('http://') || cleanSource.startsWith('https://')) {
+		const candidates = getFailoverUrls(cleanSource, ghProxy && ghProxy.startsWith('http') ? ghProxy : '');
+		for (const cand of candidates) {
+			try {
+				const controller = new AbortController();
+				const timeout = setTimeout(() => controller.abort(), 3500);
+				const res = await fetch(cand, { signal: controller.signal });
+				clearTimeout(timeout);
+				if (res.ok) {
+					const text = await res.text();
+					if (text && text.trim().length > 0) {
+						overrideConfigCache.set(cleanSource, { text, time: now });
+						return text;
+					}
+				}
+			} catch (e) {
+				console.warn(`Fetch override candidate ${cand} failed:`, e.message);
+			}
+		}
+	}
+
+	return cached ? cached.text : null;
+}
+
+// ==========================================
+// 8. 辅助功能函数与网络请求
 // ==========================================
 
 async function parseTextLines(text) {
@@ -2183,10 +2556,10 @@ async function 迁移地址列表(env, txt = 'LINK.txt') {
 }
 
 // ==========================================
-// 8. KV 网页管理界面
+// 9. KV 网页管理界面
 // ==========================================
 
-async function renderKVPage(request, env, txt = 'LINK.txt', guest, currentSubConfig, currentGhProxy = 'worker') {
+async function renderKVPage(request, env, txt = 'LINK.txt', guest, currentSubConfig, currentGhProxy = 'worker', currentOverride = '') {
 	const url = new URL(request.url);
 
 	if (request.method === "POST") {
@@ -2199,6 +2572,7 @@ async function renderKVPage(request, env, txt = 'LINK.txt', guest, currentSubCon
 					if (data.link !== undefined) await env.KV.put(txt, data.link);
 					if (data.subConfig !== undefined) await env.KV.put('CONFIG.txt', data.subConfig.trim());
 					if (data.ghProxy !== undefined) await env.KV.put('GHPROXY.txt', data.ghProxy.trim());
+					if (data.override !== undefined) await env.KV.put('OVERRIDE.txt', data.override.trim());
 					return new Response("保存成功");
 				} catch {}
 			}
@@ -2874,6 +3248,27 @@ async function renderKVPage(request, env, txt = 'LINK.txt', guest, currentSubCon
 		</div>
 	</section>
 
+	<!-- OVERRIDE Section -->
+	<section class="card">
+		<div class="card-header">
+			<h2 class="card-title">🧩 Clash YAML 覆写配置 (OVERRIDE)</h2>
+			<span class="badge badge-primary">● Clash Party 语义深度合并</span>
+		</div>
+		<div class="form-group">
+			<label class="form-label" for="overrideInput">覆写配置文件链接 (YAML) 或留空禁用：</label>
+			<input type="text" id="overrideInput" class="input-text" value="${currentOverride || ''}" placeholder="请输入 override.yaml 链接或留空禁用" />
+			<div class="form-desc">支持 Clash Party 标准覆写语义 (+rules 前置分流、rules+ 追加、! 强制覆盖、DNS/TUN 深度合并)。服务端自动合并下发，无需在多台客户端设备重复配置。</div>
+		</div>
+		<div class="form-group">
+			<label class="form-label">快速预设覆写配置：</label>
+			<select class="input-select" onchange="applyOverridePreset(this.value)">
+				<option value="">-- 选择常用覆写配置 (或在上方手动输入) --</option>
+				<option value="https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/override.yaml">🌟 个人专属覆写 (增强 Fake-IP / 防 DNS 泄露 / TUN 栈模式 / +rules 自定义分流)</option>
+				<option value="none">🚫 不使用覆写 (禁用)</option>
+			</select>
+		</div>
+	</section>
+
 	<!-- Content Management Card -->
 	<section class="card">
 		<div class="card-header">
@@ -2983,6 +3378,11 @@ function applyPreset(val) {
 	}
 }
 
+function applyOverridePreset(val) {
+	document.getElementById('overrideInput').value = val === 'none' ? '' : val;
+	showToast(val && val !== 'none' ? '已加载预设覆写配置' : '已选择禁用覆写');
+}
+
 function updateStats() {
 	const text = document.getElementById('content').value;
 	const lines = text.split('\\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
@@ -3059,6 +3459,7 @@ function saveData() {
 	const linkVal = document.getElementById('content').value;
 	const subConfigVal = document.getElementById('subConfigInput').value.trim();
 	const ghProxyVal = document.getElementById('ghProxyInput').value.trim() || 'worker';
+	const overrideVal = document.getElementById('overrideInput').value.trim();
 
 	btn.disabled = true;
 	btnText.textContent = '⏳ 保存中...';
@@ -3067,7 +3468,8 @@ function saveData() {
 	const payload = {
 		link: linkVal,
 		subConfig: subConfigVal,
-		ghProxy: ghProxyVal
+		ghProxy: ghProxyVal,
+		override: overrideVal
 	};
 
 	fetch(window.location.href, {
