@@ -31,7 +31,8 @@ import worker, {
     dumpYaml,
     deepMerge,
     applyYamlOverride,
-    loadOverrideConfig
+    loadOverrideConfig,
+    getRequestHeadersForUrl
 } from '../_worker.js';
 
 test('Extract rule provider name from URL and deduplicate', () => {
@@ -963,4 +964,57 @@ tun:
     assert.ok(yamlWithOv.includes('stack: mixed'), '生效覆写后包含 tun stack: mixed');
     assert.ok(yamlWithOv.includes('DOMAIN-SUFFIX,custom-test.com,全球直连'), '生效覆写后包含 +rules 前置规则');
 });
+
+test('Parse subconfig handles prefixed rulesets (e.g. clash-classic:https://kelee.one/...)', () => {
+    const iniText = `
+[custom]
+ruleset=OpenAi,clash-classic:https://kelee.one/Tool/Clash/Rule/AI.yaml
+ruleset=奈飞视频,clash-classic:https://rule.kelee.one/Clash/Netflix.yaml,3600
+ruleset=域名分组,clash-domain:https://example.com/domain.list
+ruleset=IP分组,clash-ipcidr:https://example.com/ip.list
+ruleset=普通规则,https://raw.githubusercontent.com/test/direct.list
+ruleset=全球直连,[]GEOIP,CN
+`;
+
+    const parsed = parseSubConfig(iniText);
+    assert.equal(parsed.rulesets.length, 5);
+    assert.equal(parsed.directRules.length, 1);
+
+    const r0 = parsed.rulesets[0];
+    assert.equal(r0.group, 'OpenAi');
+    assert.equal(r0.url, 'https://kelee.one/Tool/Clash/Rule/AI.yaml');
+    assert.equal(r0.behavior, 'classical');
+    assert.equal(r0.interval, 86400);
+
+    const r1 = parsed.rulesets[1];
+    assert.equal(r1.group, '奈飞视频');
+    assert.equal(r1.url, 'https://rule.kelee.one/Clash/Netflix.yaml');
+    assert.equal(r1.behavior, 'classical');
+    assert.equal(r1.interval, 3600);
+
+    const r2 = parsed.rulesets[2];
+    assert.equal(r2.behavior, 'domain');
+
+    const r3 = parsed.rulesets[3];
+    assert.equal(r3.behavior, 'ipcidr');
+});
+
+test('Special source kelee.one UA spoofing and automatic worker relay proxying', () => {
+    // 1. User-Agent spoofing for kelee.one
+    const keleeHeaders = getRequestHeadersForUrl('https://rule.kelee.one/Clash/Proxy.yaml');
+    assert.equal(keleeHeaders['User-Agent'], 'Loon/991 CFNetwork/3896.100.1.1.1 Darwin/27.0.0');
+
+    const standardHeaders = getRequestHeadersForUrl('https://raw.githubusercontent.com/test/rule.list');
+    assert.ok(standardHeaders['User-Agent'].includes('Clash/Mihomo'));
+
+    // 2. applyGhProxy automatically forces worker relay for kelee.one when workerRuleBase is available
+    const workerRuleBase = 'https://mysub.workers.dev/token123/rule';
+    const proxiedKelee = applyGhProxy('https://rule.kelee.one/Clash/Netflix.yaml', 'worker', workerRuleBase, 'yaml');
+    assert.equal(proxiedKelee, 'https://mysub.workers.dev/token123/rule?url=https%3A%2F%2Frule.kelee.one%2FClash%2FNetflix.yaml&format=yaml');
+
+    // 3. Even with ghProxy=direct, kelee.one MUST route through worker relay to inject required Loon UA
+    const proxiedDirectKelee = applyGhProxy('https://rule.kelee.one/Clash/Netflix.yaml', 'direct', workerRuleBase, 'yaml');
+    assert.equal(proxiedDirectKelee, 'https://mysub.workers.dev/token123/rule?url=https%3A%2F%2Frule.kelee.one%2FClash%2FNetflix.yaml&format=yaml');
+});
+
 

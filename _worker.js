@@ -1010,14 +1010,24 @@ export function parseSubConfig(iniText) {
 						const restParams = parts.slice(2).map(p => p.trim()).join(',');
 						directRules.push(`${ruleType}${restParams ? ',' + restParams : ''},${group}`);
 					}
-				} else if (target.toLowerCase().startsWith('http://') || target.toLowerCase().startsWith('https://')) {
-					// 2. 只有真正的 http/https 链接才放入 rule-providers
-					const interval = parseInt(parts[2] || '86400', 10);
-					rulesets.push({ group, url: target, interval });
 				} else {
-					// 3. 直接规则定义，如 ruleset=Group,DOMAIN-SUFFIX,example.com
-					const rest = parts.slice(1).map(p => p.trim()).join(',');
-					directRules.push(`${rest},${group}`);
+					// 2. 检查是否包含 http:// 或 https:// 远程规则集 URL (支持 clash-classic: 等前缀)
+					const httpMatch = target.match(/https?:\/\/.+/i);
+					if (httpMatch) {
+						const rawUrl = httpMatch[0].trim();
+						const prefix = target.slice(0, httpMatch.index).replace(/:$/, '').trim().toLowerCase();
+						let behavior = 'classical';
+						if (prefix.includes('domain')) behavior = 'domain';
+						else if (prefix.includes('ipcidr')) behavior = 'ipcidr';
+						else if (prefix.includes('classic')) behavior = 'classical';
+
+						const interval = parseInt(parts[2] || '86400', 10);
+						rulesets.push({ group, url: rawUrl, interval, behavior });
+					} else {
+						// 3. 直接规则定义，如 ruleset=Group,DOMAIN-SUFFIX,example.com
+						const rest = parts.slice(1).map(p => p.trim()).join(',');
+						directRules.push(`${rest},${group}`);
+					}
 				}
 			}
 		} else if (line.toLowerCase().startsWith('custom_proxy_group=')) {
@@ -1164,6 +1174,16 @@ export function convertRuleListToYaml(rawText) {
 // 内存级规则缓存 (24小时生命周期，针对单实例及非 Worker 运行环境)
 const ruleMemoryCache = new Map();
 
+export function getRequestHeadersForUrl(url) {
+	const headers = {
+		'User-Agent': 'Mozilla/5.0 (compatible; Clash/Mihomo; CF-Workers-SUB)'
+	};
+	if (url && url.toLowerCase().includes('kelee.one')) {
+		headers['User-Agent'] = 'Loon/991 CFNetwork/3896.100.1.1.1 Darwin/27.0.0';
+	}
+	return headers;
+}
+
 export async function handleRuleProxyRequest(request, targetUrl, env = {}) {
 	const cleanUrl = normalizeTargetUrl(targetUrl);
 	if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
@@ -1214,9 +1234,7 @@ export async function handleRuleProxyRequest(request, targetUrl, env = {}) {
 			const timeout = setTimeout(() => controller.abort(), 4000);
 			const resp = await fetch(cand, {
 				signal: controller.signal,
-				headers: {
-					'User-Agent': 'Mozilla/5.0 (compatible; Clash/Mihomo; CF-Workers-SUB)'
-				}
+				headers: getRequestHeadersForUrl(cand)
 			});
 			clearTimeout(timeout);
 			if (resp.ok) {
@@ -1268,6 +1286,15 @@ export function applyGhProxy(url, ghProxy = 'worker', workerRuleBase = '', forma
 	if (!url) return url;
 	const cleanUrl = normalizeTargetUrl(url);
 
+	const isKelee = cleanUrl.toLowerCase().includes('kelee.one');
+	// 对于 kelee.one 等需要伪装专用 User-Agent (Loon) 的特殊源，只要有 workerRuleBase 就必须经由 Worker 中继代理
+	if (isKelee && workerRuleBase) {
+		const sep = workerRuleBase.includes('?') ? '&' : '?';
+		let res = `${workerRuleBase}${sep}url=${encodeURIComponent(cleanUrl)}`;
+		if (format) res += `&format=${format}`;
+		return res;
+	}
+
 	// 直连或关闭加速
 	if (!ghProxy || ghProxy === 'direct' || ghProxy === 'false' || ghProxy === 'none' || ghProxy === 'off') {
 		return cleanUrl;
@@ -1313,7 +1340,7 @@ export async function loadSubConfig(url, ghProxy = 'worker') {
 		try {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 3500);
-			const res = await fetch(cand, { signal: controller.signal });
+			const res = await fetch(cand, { signal: controller.signal, headers: getRequestHeadersForUrl(cand) });
 			clearTimeout(timeout);
 			if (res.ok) {
 				const text = await res.text();
@@ -1881,6 +1908,7 @@ proxies:
 			url: applyGhProxy(r.url, ghProxy, workerRuleBase, format),
 			format,
 			ext,
+			behavior: r.behavior || 'classical',
 			interval: r.interval || 86400
 		};
 	});
@@ -1890,7 +1918,7 @@ proxies:
 		providerEntries.forEach(p => {
 			yaml += `  ${p.name}:
     type: http
-    behavior: classical
+    behavior: ${p.behavior}
     format: ${p.format}
     url: ${JSON.stringify(p.url)}
     path: ./ruleset/${p.name}.${p.ext}
@@ -2265,7 +2293,7 @@ export async function loadOverrideConfig(source, ghProxy = 'worker') {
 			try {
 				const controller = new AbortController();
 				const timeout = setTimeout(() => controller.abort(), 3500);
-				const res = await fetch(cand, { signal: controller.signal });
+				const res = await fetch(cand, { signal: controller.signal, headers: getRequestHeadersForUrl(cand) });
 				clearTimeout(timeout);
 				if (res.ok) {
 					const text = await res.text();
@@ -2302,9 +2330,7 @@ async function fetchSubscriptions(subUrls) {
 		const promises = subUrls.map(async (url) => {
 			try {
 				const res = await fetch(url, {
-					headers: {
-						'User-Agent': 'ClashforWindows/0.20.39 v2rayN/6.45'
-					},
+					headers: getRequestHeadersForUrl(url),
 					signal: controller.signal
 				});
 				if (!res.ok) return '';
