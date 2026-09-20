@@ -7,15 +7,19 @@ import worker, {
     parseVmess,
     parseTrojan,
     parseShadowsocks,
+    parseShadowsocksR,
     parseHysteria2,
+    parseTuic,
     parseNode,
     nodeToUri,
+    formatHostForUri,
     processNodes,
     generateClashConfig,
     proxyToClashYaml,
     generateBase64Config,
     parseClashProxies,
     parseSubConfig,
+    loadSubConfig,
     extractRuleProviderName,
     matchRegex,
     parseCustomProxyGroup,
@@ -1015,6 +1019,162 @@ test('Special source kelee.one UA spoofing and automatic worker relay proxying',
     // 3. Even with ghProxy=direct, kelee.one MUST route through worker relay to inject required Loon UA
     const proxiedDirectKelee = applyGhProxy('https://rule.kelee.one/Clash/Netflix.yaml', 'direct', workerRuleBase, 'yaml');
     assert.equal(proxiedDirectKelee, 'https://mysub.workers.dev/token123/rule?url=https%3A%2F%2Frule.kelee.one%2FClash%2FNetflix.yaml&format=yaml');
+});
+
+test('Worker request isolation: multiple consecutive calls do not accumulate state', async () => {
+    const env = {
+        TOKEN: 'isolation-token',
+        LINK: 'vless://d9f94f97-7521-482a-9e11-e4ab1844b204@1.1.1.1:443?security=tls#Node1',
+        LINKSUB: 'vless://d9f94f97-7521-482a-9e11-e4ab1844b204@2.2.2.2:443?security=tls#Node2'
+    };
+
+    // First request
+    const req1 = new Request('https://example.com/isolation-token?b64');
+    const res1 = await worker.fetch(req1, env);
+    const text1 = base64Decode(await res1.text());
+    const lines1 = text1.trim().split('\n').filter(Boolean);
+
+    // Second request
+    const req2 = new Request('https://example.com/isolation-token?b64');
+    const res2 = await worker.fetch(req2, env);
+    const text2 = base64Decode(await res2.text());
+    const lines2 = text2.trim().split('\n').filter(Boolean);
+
+    // Must have identical count and no duplicate accumulation
+    assert.equal(lines1.length, 2);
+    assert.equal(lines2.length, 2);
+});
+
+test('loadSubConfig: direct parsing of inline INI content without network fetching', async () => {
+    const inlineIni = `
+[custom]
+ruleset=🎯 全球直连,https://raw.githubusercontent.com/test/direct.list
+custom_proxy_group=🎯 全球直连\`select\`[]DIRECT\`[]PROXY
+`;
+    const parsed = await loadSubConfig(inlineIni);
+    assert.ok(parsed);
+    assert.equal(parsed.rulesets.length, 1);
+    assert.equal(parsed.rulesets[0].group, '🎯 全球直连');
+    assert.equal(parsed.customGroups.length, 1);
+});
+
+test('Parse nodes with IPv6 bracketed host (VLESS, Trojan, SS, Hy2, TUIC)', () => {
+    // 1. VLESS IPv6
+    const vlessIpv6 = 'vless://uuid-123@[2606:4700::1]:443?security=tls#IPv6-Vless';
+    const parsedVless = parseVless(vlessIpv6);
+    assert.ok(parsedVless);
+    assert.equal(parsedVless.server, '2606:4700::1');
+    assert.equal(parsedVless.port, 443);
+
+    // 2. Trojan IPv6
+    const trojanIpv6 = 'trojan://pass123@[2400:3200::1]:8443?security=tls#IPv6-Trojan';
+    const parsedTrojan = parseTrojan(trojanIpv6);
+    assert.ok(parsedTrojan);
+    assert.equal(parsedTrojan.server, '2400:3200::1');
+    assert.equal(parsedTrojan.port, 8443);
+
+    // 3. Shadowsocks IPv6
+    const ssUserInfo = base64Encode('aes-256-gcm:mypass');
+    const ssIpv6 = `ss://${ssUserInfo}@[2001:db8::2]:8388#IPv6-SS`;
+    const parsedSS = parseShadowsocks(ssIpv6);
+    assert.ok(parsedSS);
+    assert.equal(parsedSS.server, '2001:db8::2');
+    assert.equal(parsedSS.port, 8388);
+
+    // 4. Hysteria2 IPv6
+    const hy2Ipv6 = 'hysteria2://mypass@[2001:4860:4860::8888]:443#IPv6-Hy2';
+    const parsedHy2 = parseHysteria2(hy2Ipv6);
+    assert.ok(parsedHy2);
+    assert.equal(parsedHy2.server, '2001:4860:4860::8888');
+    assert.equal(parsedHy2.port, 443);
+
+    // 5. TUIC IPv6
+    const tuicIpv6 = 'tuic://myuuid:mypass@[2606:4700:4700::1111]:8443#IPv6-TUIC';
+    const parsedTuic = parseTuic(tuicIpv6);
+    assert.ok(parsedTuic);
+    assert.equal(parsedTuic.server, '2606:4700:4700::1111');
+    assert.equal(parsedTuic.port, 8443);
+});
+
+test('nodeToUri supports TUIC, SSR, and IPv6 authority formatting', () => {
+    // 1. formatHostForUri
+    assert.equal(formatHostForUri('1.1.1.1'), '1.1.1.1');
+    assert.equal(formatHostForUri('example.com'), 'example.com');
+    assert.equal(formatHostForUri('2606:4700::1'), '[2606:4700::1]');
+    assert.equal(formatHostForUri('[2606:4700::1]'), '[2606:4700::1]');
+
+    // 2. nodeToUri for TUIC
+    const tuicNode = {
+        name: 'My Tuic Node',
+        type: 'tuic',
+        server: '2606:4700::1',
+        port: 8443,
+        uuid: 'uuid-abc',
+        password: 'pass-def',
+        sni: 'tuic.example.com',
+        congestionController: 'bbr'
+    };
+    const tuicUri = nodeToUri(tuicNode);
+    assert.ok(tuicUri.startsWith('tuic://uuid-abc:pass-def@[2606:4700::1]:8443'));
+    assert.ok(tuicUri.includes('congestion_controller=bbr'));
+    assert.ok(tuicUri.includes('#My%20Tuic%20Node'));
+
+    // 3. nodeToUri for SSR
+    const ssrNode = {
+        name: 'My SSR Node',
+        type: 'ssr',
+        server: 'ssr.example.com',
+        port: 443,
+        protocol: 'auth_aes128_md5',
+        cipher: 'aes-128-cfb',
+        obfs: 'tls1.2_ticket_auth',
+        password: 'password123'
+    };
+    const ssrUri = nodeToUri(ssrNode);
+    assert.ok(ssrUri.startsWith('ssr://'));
+    const parsedBack = parseShadowsocksR(ssrUri);
+    assert.ok(parsedBack);
+    assert.equal(parsedBack.server, 'ssr.example.com');
+    assert.equal(parsedBack.port, 443);
+    assert.equal(parsedBack.cipher, 'aes-128-cfb');
+    assert.equal(parsedBack.name, 'My SSR Node');
+});
+
+test('ShadowsocksR round-trip preserves bracketed IPv6 host', () => {
+    const ssrNode = {
+        name: 'IPv6 SSR',
+        type: 'ssr',
+        server: '2001:db8::1',
+        port: 443,
+        protocol: 'origin',
+        cipher: 'none',
+        obfs: 'plain',
+        password: 'password123'
+    };
+    const uri = nodeToUri(ssrNode);
+    const parsed = parseShadowsocksR(uri);
+    assert.ok(parsed);
+    assert.equal(parsed.server, '2001:db8::1');
+    assert.equal(parsed.port, 443);
+    assert.equal(parsed.password, 'password123');
+});
+
+test('loadSubConfig fetches HTTP URLs containing ruleset query parameters', async () => {
+    const originalFetch = globalThis.fetch;
+    let requestedUrl = '';
+    globalThis.fetch = async (requestUrl) => {
+        requestedUrl = String(requestUrl);
+        return new Response('[custom]\nruleset=🎯 全球直连,https://example.com/direct.list');
+    };
+
+    try {
+        const parsed = await loadSubConfig('https://example.com/config?ruleset=test');
+        assert.equal(requestedUrl, 'https://example.com/config?ruleset=test');
+        assert.ok(parsed);
+        assert.equal(parsed.rulesets.length, 1);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
 });
 
 

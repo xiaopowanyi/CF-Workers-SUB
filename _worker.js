@@ -6,32 +6,39 @@
  * 支持通过 环境变量 (SUBCONFIG) 或 前端页面选择/填写保存自定义 .ini 规则配置链接
  */
 
-let mytoken = 'auto';
-let guestToken = '';
-let BotToken = '';
-let ChatID = '';
-let TG = 0;
-let FileName = 'CF-Workers-SUB';
-let SUBUpdateTime = 6;
-let total = 99; // TB
-let timestamp = 4102329600000; // 2099-12-31
+// 默认配置常量
+const DEFAULT_TOKEN = 'auto';
+const DEFAULT_FILENAME = 'CF-Workers-SUB';
+const DEFAULT_SUB_UPDATE_TIME = 6;
+const DEFAULT_TOTAL = 99; // TB
+const DEFAULT_TIMESTAMP = 4102329600000; // 2099-12-31
 
-// 默认自建节点与订阅链接
-let MainData = `
+// 默认自建节点与订阅链接常量
+const DEFAULT_MAIN_DATA = `
 https://cfxr.eu.org/getSub
 `;
 
-// 默认订阅规则配置文件 (支持环境变量 SUBCONFIG 覆盖，或前端管理页面填写保存至 KV)
-let subConfig = "https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/my.ini";
+// 默认订阅规则配置文件常量
+const DEFAULT_SUBCONFIG = "https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/my.ini";
 
-// SUBCONFIG 缓存 (URL -> { parsed, time })
+// 默认 Clash 覆写配置文件常量
+const DEFAULT_OVERRIDE = "https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/override.yaml";
+
+// 缓存容器与容量上限保护机制 (LRU/FIFO 淘汰，防止内存溢出 OOM)
+const MAX_CACHE_ENTRIES = 150;
 const subConfigCache = new Map();
-
-// 默认 Clash 覆写配置文件 (支持环境变量 OVERRIDE 覆盖，或前端管理页面填写保存至 KV)
-let defaultOverride = "https://raw.githubusercontent.com/xiaopowanyi/Base/refs/heads/main/override.yaml";
-
-// OVERRIDE 缓存 (URL -> { text, time })
 const overrideConfigCache = new Map();
+const ruleMemoryCache = new Map();
+
+function setCacheWithLimit(map, key, value, maxItems = MAX_CACHE_ENTRIES) {
+	if (map.size >= maxItems) {
+		const oldestKey = map.keys().next().value;
+		if (oldestKey !== undefined) {
+			map.delete(oldestKey);
+		}
+	}
+	map.set(key, value);
+}
 
 export default {
 	async fetch(request, env) {
@@ -40,20 +47,20 @@ export default {
 		const url = new URL(request.url);
 		const token = url.searchParams.get('token');
 
-		mytoken = env.TOKEN || mytoken;
-		BotToken = env.TGTOKEN || BotToken;
-		ChatID = env.TGID || ChatID;
-		TG = env.TG || TG;
-		subConfig = env.SUBCONFIG || subConfig;
-		FileName = env.SUBNAME || FileName;
-		SUBUpdateTime = env.SUBUPTIME || SUBUpdateTime;
+		const mytoken = env.TOKEN || DEFAULT_TOKEN;
+		const BotToken = env.TGTOKEN || '';
+		const ChatID = env.TGID || '';
+		const TG = env.TG || 0;
+		const subConfig = env.SUBCONFIG || DEFAULT_SUBCONFIG;
+		const FileName = env.SUBNAME || DEFAULT_FILENAME;
+		const SUBUpdateTime = env.SUBUPTIME || DEFAULT_SUB_UPDATE_TIME;
 		const envScv = env.SCV === 'true';
 
 		const currentDate = new Date();
 		currentDate.setHours(0, 0, 0, 0);
 		const timeTemp = Math.ceil(currentDate.getTime() / 1000);
 		const fakeToken = await MD5MD5(`${mytoken}${timeTemp}`);
-		guestToken = env.GUESTTOKEN || env.GUEST || guestToken;
+		let guestToken = env.GUESTTOKEN || env.GUEST || '';
 		if (!guestToken) guestToken = await MD5MD5(mytoken);
 		const 访客订阅 = guestToken;
 
@@ -76,7 +83,7 @@ export default {
 
 		if (!isAuthorized) {
 			if (TG == 1 && url.pathname !== "/" && url.pathname !== "/favicon.ico") {
-				await sendMessage(`#异常访问 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgent}\n域名: ${url.hostname}\n入口: ${url.pathname + url.search}`);
+				await sendMessage(`#异常访问 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgent}\n域名: ${url.hostname}\n入口: ${url.pathname + url.search}`, BotToken, ChatID);
 			}
 			if (env.URL302) return Response.redirect(env.URL302, 302);
 			else if (env.URL) return await proxyURL(env.URL, url);
@@ -119,31 +126,34 @@ export default {
 			currentOverride = await env.KV.get('OVERRIDE.txt');
 		}
 		if (currentOverride === null || currentOverride === undefined) {
-			currentOverride = (env.OVERRIDE !== undefined) ? env.OVERRIDE : defaultOverride;
+			currentOverride = (env.OVERRIDE !== undefined) ? env.OVERRIDE : DEFAULT_OVERRIDE;
 		}
+
+		// 独立的局部 MainData 变量，彻底防止并发复用时内存泄漏和状态累加
+		let currentMainData = DEFAULT_MAIN_DATA;
 
 		// KV 管理页面与数据加载
 		if (env.KV) {
 			await 迁移地址列表(env, 'LINK.txt');
 			if ((request.method === "POST" || userAgent.includes('mozilla')) && !url.search && url.pathname !== '/sub') {
-				await sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}\n域名: ${url.hostname}\n入口: ${url.pathname + url.search}`);
-				return await renderKVPage(request, env, 'LINK.txt', 访客订阅, currentSubConfig, currentGhProxy, currentOverride);
+				await sendMessage(`#编辑订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}\n域名: ${url.hostname}\n入口: ${url.pathname + url.search}`, BotToken, ChatID);
+				return await renderKVPage(request, env, 'LINK.txt', 访客订阅, currentSubConfig, currentGhProxy, currentOverride, mytoken, FileName);
 			} else {
-				MainData = await env.KV.get('LINK.txt') || MainData;
+				currentMainData = await env.KV.get('LINK.txt') || currentMainData;
 			}
 		} else {
-			MainData = env.LINK || MainData;
+			currentMainData = env.LINK || currentMainData;
 			if (env.LINKSUB) {
 				const subs = await parseTextLines(env.LINKSUB);
-				MainData = MainData + '\n' + subs.join('\n');
+				currentMainData = currentMainData + '\n' + subs.join('\n');
 			}
 		}
 
 		// 记录访问日志
-		await sendMessage(`#获取订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}\n域名: ${url.hostname}\n入口: ${url.pathname + url.search}`);
+		await sendMessage(`#获取订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}\n域名: ${url.hostname}\n入口: ${url.pathname + url.search}`, BotToken, ChatID);
 
 		// 收集自建节点与远程订阅链接
-		const allLines = await parseTextLines(MainData);
+		const allLines = await parseTextLines(currentMainData);
 		const directNodes = [];
 		const remoteSubUrls = [];
 
@@ -292,11 +302,14 @@ function safeDecodeURIComponent(str) {
 // ==========================================
 
 export function parseVless(rawUri, envScv = false) {
-	const match = rawUri.match(/^vless:\/\/([^@]+)@([^:?#]+):([0-9]+)(\?[^#]*)?(#.*)?$/i);
+	const match = rawUri.match(/^vless:\/\/([^@]+)@(\[[^\]]+\]|[^:?#]+):([0-9]+)(\?[^#]*)?(#.*)?$/i);
 	if (!match) return null;
 
 	const uuid = match[1];
-	const server = match[2];
+	let server = match[2];
+	if (server.startsWith('[') && server.endsWith(']')) {
+		server = server.slice(1, -1);
+	}
 	const port = parseInt(match[3], 10);
 	const searchParams = new URLSearchParams(match[4] ? match[4].slice(1) : '');
 	const name = match[5] ? safeDecodeURIComponent(match[5].slice(1)).trim() : `${server}:${port}`;
@@ -419,11 +432,14 @@ export function parseVmess(rawUri, envScv = false) {
 }
 
 export function parseTrojan(rawUri, envScv = false) {
-	const match = rawUri.match(/^trojan:\/\/([^@]+)@([^:?#]+):([0-9]+)(\?[^#]*)?(#.*)?$/i);
+	const match = rawUri.match(/^trojan:\/\/([^@]+)@(\[[^\]]+\]|[^:?#]+):([0-9]+)(\?[^#]*)?(#.*)?$/i);
 	if (!match) return null;
 
 	const password = match[1];
-	const server = match[2];
+	let server = match[2];
+	if (server.startsWith('[') && server.endsWith(']')) {
+		server = server.slice(1, -1);
+	}
 	const port = parseInt(match[3], 10);
 	const searchParams = new URLSearchParams(match[4] ? match[4].slice(1) : '');
 	const name = match[5] ? safeDecodeURIComponent(match[5].slice(1)).trim() : `${server}:${port}`;
@@ -502,19 +518,25 @@ export function parseShadowsocks(rawUri) {
 			password = userInfo.slice(colonIdx + 1);
 		}
 
-		const spMatch = serverPort.match(/^([^:]+):([0-9]+)$/);
+		const spMatch = serverPort.match(/^(\[[^\]]+\]|[^:?#]+):([0-9]+)$/);
 		if (spMatch) {
 			server = spMatch[1];
+			if (server.startsWith('[') && server.endsWith(']')) {
+				server = server.slice(1, -1);
+			}
 			port = parseInt(spMatch[2], 10);
 		}
 	} else {
 		try {
 			const decoded = base64Decode(main);
-			const m = decoded.match(/^([^:]+):([^@]+)@([^:]+):([0-9]+)$/);
+			const m = decoded.match(/^([^:]+):([^@]+)@(\[[^\]]+\]|[^:?#]+):([0-9]+)$/);
 			if (m) {
 				cipher = m[1];
 				password = m[2];
 				server = m[3];
+				if (server.startsWith('[') && server.endsWith(']')) {
+					server = server.slice(1, -1);
+				}
 				port = parseInt(m[4], 10);
 			}
 		} catch {}
@@ -555,15 +577,17 @@ export function parseShadowsocksR(rawUri) {
 	try {
 		const content = base64Decode(rawUri.replace(/^ssr:\/\//i, '').trim());
 		const parts = content.split('/?');
-		const main = parts[0].split(':');
-		if (main.length < 6) return null;
+		const mainMatch = parts[0].match(/^(\[[^\]]+\]|[^:]+):(\d+):([^:]+):([^:]+):([^:]+):([^/]+)$/);
+		if (!mainMatch) return null;
 
-		const server = main[0];
-		const port = parseInt(main[1], 10);
-		const protocol = main[2];
-		const cipher = main[3];
-		const obfs = main[4];
-		const password = base64Decode(main[5]);
+		const server = mainMatch[1].startsWith('[') && mainMatch[1].endsWith(']')
+			? mainMatch[1].slice(1, -1)
+			: mainMatch[1];
+		const port = parseInt(mainMatch[2], 10);
+		const protocol = mainMatch[3];
+		const cipher = mainMatch[4];
+		const obfs = mainMatch[5];
+		const password = base64Decode(mainMatch[6]);
 
 		let name = `${server}:${port}`;
 		let obfsParam = '';
@@ -602,11 +626,14 @@ export function parseShadowsocksR(rawUri) {
 
 export function parseHysteria2(rawUri) {
 	const clean = rawUri.replace(/^(hysteria2|hy2):\/\//i, '').trim();
-	const match = clean.match(/^([^@]+)@([^:?#]+):([0-9, \-]+)(\?[^#]*)?(#.*)?$/i);
+	const match = clean.match(/^([^@]+)@(\[[^\]]+\]|[^:?#]+):([0-9, \-]+)(\?[^#]*)?(#.*)?$/i);
 	if (!match) return null;
 
 	const password = match[1];
-	const server = match[2];
+	let server = match[2];
+	if (server.startsWith('[') && server.endsWith(']')) {
+		server = server.slice(1, -1);
+	}
 	const portStr = match[3];
 	const port = parseInt(portStr.split(',')[0].split('-')[0], 10);
 	const searchParams = new URLSearchParams(match[4] ? match[4].slice(1) : '');
@@ -638,12 +665,15 @@ export function parseHysteria2(rawUri) {
 
 export function parseTuic(rawUri) {
 	const clean = rawUri.replace(/^tuic:\/\//i, '').trim();
-	const match = clean.match(/^([^:]+):([^@]+)@([^:?#]+):([0-9]+)(\?[^#]*)?(#.*)?$/i);
+	const match = clean.match(/^([^:]+):([^@]+)@(\[[^\]]+\]|[^:?#]+):([0-9]+)(\?[^#]*)?(#.*)?$/i);
 	if (!match) return null;
 
 	const uuid = match[1];
 	const password = match[2];
-	const server = match[3];
+	let server = match[3];
+	if (server.startsWith('[') && server.endsWith(']')) {
+		server = server.slice(1, -1);
+	}
 	const port = parseInt(match[4], 10);
 	const searchParams = new URLSearchParams(match[5] ? match[5].slice(1) : '');
 	const name = match[6] ? safeDecodeURIComponent(match[6].slice(1)).trim() : `${server}:${port}`;
@@ -689,8 +719,18 @@ export function parseNode(line, envScv = false) {
 	return null;
 }
 
+export function formatHostForUri(server) {
+	if (!server) return '';
+	if (server.includes(':') && !server.startsWith('[')) {
+		return `[${server}]`;
+	}
+	return server;
+}
+
 export function nodeToUri(node) {
 	if (node.rawUri) return node.rawUri;
+
+	const host = formatHostForUri(node.server);
 
 	if (node.type === 'vmess') {
 		const vmessObj = {
@@ -729,7 +769,7 @@ export function nodeToUri(node) {
 		if (node.realityOpts?.spiderX) params.set('spx', node.realityOpts.spiderX);
 		if (node.flow) params.set('flow', node.flow);
 
-		return `vless://${node.uuid}@${node.server}:${node.port}?${params.toString()}#${encodeURIComponent(node.name)}`;
+		return `vless://${node.uuid}@${host}:${node.port}?${params.toString()}#${encodeURIComponent(node.name)}`;
 	}
 
 	if (node.type === 'trojan') {
@@ -740,12 +780,23 @@ export function nodeToUri(node) {
 		if (node.wsOpts?.path) params.set('path', node.wsOpts.path);
 		if (node.wsOpts?.headers?.Host) params.set('host', node.wsOpts.headers.Host);
 		if (node.skipCertVerify) params.set('allowInsecure', '1');
-		return `trojan://${encodeURIComponent(node.password)}@${node.server}:${node.port}?${params.toString()}#${encodeURIComponent(node.name)}`;
+		return `trojan://${encodeURIComponent(node.password)}@${host}:${node.port}?${params.toString()}#${encodeURIComponent(node.name)}`;
 	}
 
 	if (node.type === 'ss') {
 		const userInfo = base64Encode(`${node.cipher}:${node.password}`);
-		return `ss://${userInfo}@${node.server}:${node.port}#${encodeURIComponent(node.name)}`;
+		return `ss://${userInfo}@${host}:${node.port}#${encodeURIComponent(node.name)}`;
+	}
+
+	if (node.type === 'ssr') {
+		const passB64 = base64Encode(node.password || '');
+		const mainStr = `${host}:${node.port}:${node.protocol || 'origin'}:${node.cipher || 'none'}:${node.obfs || 'plain'}:${passB64}`;
+		const params = new URLSearchParams();
+		if (node.name) params.set('remarks', base64Encode(node.name));
+		if (node.obfsParam) params.set('obfsparam', base64Encode(node.obfsParam));
+		if (node.protocolParam) params.set('protoparam', base64Encode(node.protocolParam));
+		const full = `${mainStr}/?${params.toString()}`;
+		return `ssr://${base64Encode(full)}`;
 	}
 
 	if (node.type === 'hysteria2') {
@@ -756,7 +807,17 @@ export function nodeToUri(node) {
 			params.set('obfs', node.obfs);
 			if (node.obfsPassword) params.set('obfs-password', node.obfsPassword);
 		}
-		return `hysteria2://${encodeURIComponent(node.password)}@${node.server}:${node.port}?${params.toString()}#${encodeURIComponent(node.name)}`;
+		return `hysteria2://${encodeURIComponent(node.password)}@${host}:${node.port}?${params.toString()}#${encodeURIComponent(node.name)}`;
+	}
+
+	if (node.type === 'tuic') {
+		const params = new URLSearchParams();
+		if (node.sni) params.set('sni', node.sni);
+		if (node.skipCertVerify) params.set('allow_insecure', '1');
+		if (node.congestionController) params.set('congestion_controller', node.congestionController);
+		if (node.udpRelayMode) params.set('udp_relay_mode', node.udpRelayMode);
+		const query = params.toString() ? `?${params.toString()}` : '';
+		return `tuic://${node.uuid || ''}:${node.password || ''}@${host}:${node.port}${query}#${encodeURIComponent(node.name || '')}`;
 	}
 
 	return '';
@@ -1171,9 +1232,6 @@ export function convertRuleListToYaml(rawText) {
 	return `payload:\n${validRules.join('\n')}\n`;
 }
 
-// 内存级规则缓存 (24小时生命周期，针对单实例及非 Worker 运行环境)
-const ruleMemoryCache = new Map();
-
 export function getRequestHeadersForUrl(url) {
 	const headers = {
 		'User-Agent': 'Mozilla/5.0 (compatible; Clash/Mihomo; CF-Workers-SUB)'
@@ -1245,12 +1303,8 @@ export async function handleRuleProxyRequest(request, targetUrl, env = {}) {
 						? cleanTextRuleList(rawBody)
 						: convertRuleListToYaml(rawBody);
 
-					// 写入内存缓存 (控制缓存上限 200 条防止内存膨胀)
-					if (ruleMemoryCache.size > 200) {
-						const firstKey = ruleMemoryCache.keys().next().value;
-						ruleMemoryCache.delete(firstKey);
-					}
-					ruleMemoryCache.set(cacheId, { text: processedText, time: now });
+					// 写入内存缓存 (控制缓存上限防止内存膨胀)
+					setCacheWithLimit(ruleMemoryCache, cacheId, { text: processedText, time: now }, MAX_CACHE_ENTRIES);
 
 					const headers = new Headers();
 					headers.set('Content-Type', targetFormat === 'text' ? 'text/plain; charset=utf-8' : 'text/yaml; charset=utf-8');
@@ -1327,31 +1381,46 @@ export function applyGhProxy(url, ghProxy = 'worker', workerRuleBase = '', forma
 }
 
 export async function loadSubConfig(url, ghProxy = 'worker') {
-	if (!url) return null;
+	if (!url || !url.trim()) return null;
+	const cleanSource = url.trim();
+	const isHttpSource = cleanSource.startsWith('http://') || cleanSource.startsWith('https://');
+
+	// 如果直接是 INI 规则文本（包含换行，或者包含 [custom] / ruleset= 等特征）
+	if (!isHttpSource && (cleanSource.includes('\n') || cleanSource.includes('[custom]') || cleanSource.includes('ruleset='))) {
+		try {
+			return parseSubConfig(cleanSource);
+		} catch (e) {
+			console.warn('Failed to parse inline subConfig:', e);
+			return null;
+		}
+	}
+
 	const now = Date.now();
-	const cached = subConfigCache.get(url);
+	const cached = subConfigCache.get(cleanSource);
 	if (cached && (now - cached.time < 600000)) {
 		return cached.parsed;
 	}
 
-	// 使用多源容灾池拉取规则配置文件 (即使单一镜像宕机也能从容流转)
-	const candidates = getFailoverUrls(url, ghProxy && ghProxy.startsWith('http') ? ghProxy : '');
-	for (const cand of candidates) {
-		try {
-			const controller = new AbortController();
-			const timeout = setTimeout(() => controller.abort(), 3500);
-			const res = await fetch(cand, { signal: controller.signal, headers: getRequestHeadersForUrl(cand) });
-			clearTimeout(timeout);
-			if (res.ok) {
-				const text = await res.text();
-				if (text && text.trim().length > 0) {
-					const parsed = parseSubConfig(text);
-					subConfigCache.set(url, { parsed, time: now });
-					return parsed;
+	if (isHttpSource) {
+		// 使用多源容灾池拉取规则配置文件 (即使单一镜像宕机也能从容流转)
+		const candidates = getFailoverUrls(cleanSource, ghProxy && ghProxy.startsWith('http') ? ghProxy : '');
+		for (const cand of candidates) {
+			try {
+				const controller = new AbortController();
+				const timeout = setTimeout(() => controller.abort(), 3500);
+				const res = await fetch(cand, { signal: controller.signal, headers: getRequestHeadersForUrl(cand) });
+				clearTimeout(timeout);
+				if (res.ok) {
+					const text = await res.text();
+					if (text && text.trim().length > 0) {
+						const parsed = parseSubConfig(text);
+						setCacheWithLimit(subConfigCache, cleanSource, { parsed, time: now }, MAX_CACHE_ENTRIES);
+						return parsed;
+					}
 				}
+			} catch (e) {
+				console.warn(`Fetch subConfig candidate ${cand} failed:`, e.message);
 			}
-		} catch (e) {
-			console.warn(`Fetch subConfig candidate ${cand} failed:`, e.message);
 		}
 	}
 
@@ -2298,7 +2367,7 @@ export async function loadOverrideConfig(source, ghProxy = 'worker') {
 				if (res.ok) {
 					const text = await res.text();
 					if (text && text.trim().length > 0) {
-						overrideConfigCache.set(cleanSource, { text, time: now });
+						setCacheWithLimit(overrideConfigCache, cleanSource, { text, time: now }, MAX_CACHE_ENTRIES);
 						return text;
 					}
 				}
@@ -2513,8 +2582,8 @@ export async function MD5MD5(text) {
 	}
 }
 
-async function sendMessage(type, ip, add_data = "") {
-	if (BotToken !== '' && ChatID !== '') {
+async function sendMessage(type, ip, add_data = "", botToken = "", chatId = "") {
+	if (botToken !== '' && chatId !== '') {
 		let msg = "";
 		try {
 			const response = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
@@ -2528,7 +2597,7 @@ async function sendMessage(type, ip, add_data = "") {
 			msg = `${type}\nIP: ${ip}\n${add_data}`;
 		}
 
-		const tgUrl = `https://api.telegram.org/bot${BotToken}/sendMessage?chat_id=${ChatID}&parse_mode=HTML&text=${encodeURIComponent(msg)}`;
+		const tgUrl = `https://api.telegram.org/bot${botToken}/sendMessage?chat_id=${chatId}&parse_mode=HTML&text=${encodeURIComponent(msg)}`;
 		return fetch(tgUrl, {
 			headers: { 'User-Agent': 'Mozilla/5.0 Chrome/90.0.4430.72' }
 		}).catch(() => {});
@@ -2563,7 +2632,10 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
 </head>
 <body>
 <h1>Welcome to nginx!</h1>
-<p>If you see this page, the nginx web server is successfully installed and working.</p>
+<p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
+<p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at <a href="http://nginx.com/">nginx.com</a>.</p>
+<p><em>Thank you for using nginx.</em></p>
 </body>
 </html>`;
 }
@@ -2585,8 +2657,10 @@ async function 迁移地址列表(env, txt = 'LINK.txt') {
 // 9. KV 网页管理界面
 // ==========================================
 
-async function renderKVPage(request, env, txt = 'LINK.txt', guest, currentSubConfig, currentGhProxy = 'worker', currentOverride = '') {
+async function renderKVPage(request, env, txt = 'LINK.txt', guest, currentSubConfig, currentGhProxy = 'worker', currentOverride = '', currentToken = '', subName = '') {
 	const url = new URL(request.url);
+	const mytoken = currentToken || env.TOKEN || DEFAULT_TOKEN;
+	const FileName = subName || env.SUBNAME || DEFAULT_FILENAME;
 
 	if (request.method === "POST") {
 		if (!env.KV) return new Response("未绑定 KV 命名空间", { status: 400 });
