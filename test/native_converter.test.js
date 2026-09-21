@@ -36,6 +36,7 @@ import worker, {
     deepMerge,
     applyYamlOverride,
     loadOverrideConfig,
+    sanitizeDnsFakeIpFilter,
     getRequestHeadersForUrl
 } from '../_worker.js';
 
@@ -1176,5 +1177,30 @@ test('loadSubConfig fetches HTTP URLs containing ruleset query parameters', asyn
         globalThis.fetch = originalFetch;
     }
 });
+
+test('sanitizeDnsFakeIpFilter converts rule mode fake-ip-filter to blacklist for Clash Party compatibility', () => {
+    const baseYaml = `
+port: 7890
+dns:
+  enable: true
+`;
+    const overrideYaml = `
+dns:
+  fake-ip-filter-mode: rule
+  fake-ip-filter:
+    - DOMAIN-SUFFIX,lan,real-ip
+    - DOMAIN-KEYWORD,time,real-ip
+    - DOMAIN,localhost.ptlogin2.qq.com,real-ip
+    - DOMAIN-SUFFIX,workers.dev,fake-ip
+    - MATCH,fake-ip
+`;
+    const merged = applyYamlOverride(baseYaml, overrideYaml);
+    assert.ok(!merged.includes('fake-ip-filter-mode: rule'));
+    assert.ok(merged.includes('+.lan'));
+    assert.ok(merged.includes('*time*'));
+    assert.ok(merged.includes('localhost.ptlogin2.qq.com'));
+    assert.ok(!merged.includes('workers.dev'));
+});
+
 
 

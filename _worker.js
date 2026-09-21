@@ -2328,12 +2328,48 @@ export function dumpYaml(obj, indent = 0) {
 	return out;
 }
 
+export function sanitizeDnsFakeIpFilter(dns) {
+	if (!dns || typeof dns !== 'object') return;
+	if (dns['fake-ip-filter-mode'] === 'rule') {
+		delete dns['fake-ip-filter-mode'];
+		if (Array.isArray(dns['fake-ip-filter'])) {
+			const sanitized = [];
+			for (const item of dns['fake-ip-filter']) {
+				if (typeof item !== 'string') continue;
+				const parts = item.split(',').map(s => s.trim());
+				if (parts.length >= 3) {
+					const [type, val, action] = parts;
+					if (action.toLowerCase() === 'real-ip') {
+						if (type.toUpperCase() === 'DOMAIN-SUFFIX') {
+							sanitized.push(`+.${val}`);
+						} else if (type.toUpperCase() === 'DOMAIN-KEYWORD') {
+							sanitized.push(`*${val}*`);
+						} else if (type.toUpperCase() === 'DOMAIN') {
+							sanitized.push(val);
+						} else {
+							sanitized.push(val);
+						}
+					}
+				} else if (parts.length === 2 && parts[0].toUpperCase() === 'MATCH') {
+					// skip MATCH,fake-ip as it's default in blacklist mode
+				} else {
+					sanitized.push(item);
+				}
+			}
+			dns['fake-ip-filter'] = sanitized;
+		}
+	}
+}
+
 export function applyYamlOverride(baseYaml, overrideYaml) {
 	if (!overrideYaml || !overrideYaml.trim()) return baseYaml;
 	try {
 		const baseObj = parseYaml(baseYaml);
 		const overrideObj = parseYaml(overrideYaml);
 		const mergedObj = deepMerge(baseObj, overrideObj, true);
+		if (mergedObj.dns) {
+			sanitizeDnsFakeIpFilter(mergedObj.dns);
+		}
 		return dumpYaml(mergedObj);
 	} catch (err) {
 		console.error('Error in applyYamlOverride:', err);
