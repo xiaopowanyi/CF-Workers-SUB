@@ -1196,10 +1196,31 @@ dns:
 `;
     const merged = applyYamlOverride(baseYaml, overrideYaml);
     assert.ok(!merged.includes('fake-ip-filter-mode: rule'));
-    assert.ok(merged.includes('+.lan'));
-    assert.ok(merged.includes('*time*'));
+    assert.ok(merged.includes('"+.lan"'));
+    assert.ok(merged.includes('"*time*"'));
     assert.ok(merged.includes('localhost.ptlogin2.qq.com'));
     assert.ok(!merged.includes('workers.dev'));
+});
+
+test('dumpYaml quotes scalars starting with special characters like * and + to prevent alias errors', () => {
+    const obj = {
+        dns: {
+            'fake-ip-filter': [
+                '+.lan',
+                '*time*',
+                '*ntp*',
+                '*tracker*',
+                'normal.domain.com'
+            ]
+        }
+    };
+    const dumped = dumpYaml(obj);
+    assert.ok(dumped.includes('- "+.lan"'), 'contains quoted +.lan');
+    assert.ok(dumped.includes('- "*time*"'), 'contains quoted *time*');
+    assert.ok(dumped.includes('- "*ntp*"'), 'contains quoted *ntp*');
+    assert.ok(dumped.includes('- "*tracker*"'), 'contains quoted *tracker*');
+    assert.ok(dumped.includes('normal.domain.com'), 'contains unquoted normal domain');
+    assert.ok(!dumped.includes('- *time*'), 'never emits unquoted alias *time*');
 });
 
 

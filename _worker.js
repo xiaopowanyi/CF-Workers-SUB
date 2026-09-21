@@ -2249,7 +2249,15 @@ function formatYamlKey(key) {
 	if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
 		return key;
 	}
-	if (key.includes(':') || key.includes(' ') || key.includes(',') || key.includes('#') || key.startsWith('-')) {
+	if (
+		/^[*&!%@`|>?[\]{},#~]/.test(key) ||
+		key.includes(':') ||
+		key.includes(' ') ||
+		key.includes(',') ||
+		key.includes('#') ||
+		key.startsWith('-') ||
+		key.startsWith('+')
+	) {
 		return JSON.stringify(key);
 	}
 	return key;
@@ -2262,7 +2270,20 @@ function formatYamlScalar(val) {
 	const str = String(val);
 	if (str === '') return '""';
 	if (str === 'true' || str === 'false' || str === 'null' || str === '~') return `"${str}"`;
-	if (str.includes('#') || str.includes(': ') || str.startsWith('- ') || str.startsWith('"') || str.startsWith("'")) {
+	if ((str.startsWith('"') && str.endsWith('"')) || (str.startsWith("'") && str.endsWith("'"))) {
+		return str;
+	}
+	if (
+		/^[*&!%@`|>?[\]{},#~]/.test(str) ||
+		str.startsWith('-') ||
+		str.startsWith('+') ||
+		str.includes(': ') ||
+		str.includes('#') ||
+		str.startsWith(' ') ||
+		str.endsWith(' ') ||
+		str.includes('\n') ||
+		str.includes('\r')
+	) {
 		return JSON.stringify(str);
 	}
 	return str;
