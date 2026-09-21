@@ -1178,7 +1178,7 @@ test('loadSubConfig fetches HTTP URLs containing ruleset query parameters', asyn
     }
 });
 
-test('sanitizeDnsFakeIpFilter converts rule mode fake-ip-filter to blacklist for Clash Party compatibility', () => {
+test('sanitizeDnsFakeIpFilter converts rule mode fake-ip-filter to blacklist and drops invalid domain wildcards', () => {
     const baseYaml = `
 port: 7890
 dns:
@@ -1193,12 +1193,17 @@ dns:
     - DOMAIN,localhost.ptlogin2.qq.com,real-ip
     - DOMAIN-SUFFIX,workers.dev,fake-ip
     - MATCH,fake-ip
+    - "*invalid*time*"
+    - "+.valid.domain.com"
 `;
     const merged = applyYamlOverride(baseYaml, overrideYaml);
     assert.ok(!merged.includes('fake-ip-filter-mode: rule'));
     assert.ok(merged.includes('"+.lan"'));
-    assert.ok(merged.includes('"*time*"'));
+    assert.ok(merged.includes('time.*.com'));
+    assert.ok(merged.includes('time.windows.com'));
     assert.ok(merged.includes('localhost.ptlogin2.qq.com'));
+    assert.ok(merged.includes('"+.valid.domain.com"'));
+    assert.ok(!merged.includes('*invalid*time*'), 'drops invalid domain wildcards where * does not occupy whole label');
     assert.ok(!merged.includes('workers.dev'));
 });
 
@@ -1207,20 +1212,18 @@ test('dumpYaml quotes scalars starting with special characters like * and + to p
         dns: {
             'fake-ip-filter': [
                 '+.lan',
-                '*time*',
-                '*ntp*',
-                '*tracker*',
+                'time.*.com',
+                '*.ntp.org.cn',
                 'normal.domain.com'
             ]
         }
     };
     const dumped = dumpYaml(obj);
     assert.ok(dumped.includes('- "+.lan"'), 'contains quoted +.lan');
-    assert.ok(dumped.includes('- "*time*"'), 'contains quoted *time*');
-    assert.ok(dumped.includes('- "*ntp*"'), 'contains quoted *ntp*');
-    assert.ok(dumped.includes('- "*tracker*"'), 'contains quoted *tracker*');
+    assert.ok(dumped.includes('- "*.ntp.org.cn"'), 'contains quoted *.ntp.org.cn');
+    assert.ok(dumped.includes('time.*.com'), 'contains time.*.com');
     assert.ok(dumped.includes('normal.domain.com'), 'contains unquoted normal domain');
-    assert.ok(!dumped.includes('- *time*'), 'never emits unquoted alias *time*');
+    assert.ok(!dumped.includes('- *'), 'never emits unquoted alias reference');
 });
 
 

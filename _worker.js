@@ -2349,36 +2349,65 @@ export function dumpYaml(obj, indent = 0) {
 	return out;
 }
 
+export function isValidMihomoFakeIpDomain(domain) {
+	if (!domain || typeof domain !== 'string') return false;
+	const d = domain.trim();
+	if (!d) return false;
+	let stripped = d;
+	if (stripped.startsWith('+.')) {
+		stripped = stripped.slice(2);
+	}
+	const labels = stripped.split('.');
+	for (const label of labels) {
+		if (label.includes('*') && label !== '*') {
+			return false; // '*' wildcard must occupy the entire label
+		}
+	}
+	return true;
+}
+
 export function sanitizeDnsFakeIpFilter(dns) {
 	if (!dns || typeof dns !== 'object') return;
 	if (dns['fake-ip-filter-mode'] === 'rule') {
 		delete dns['fake-ip-filter-mode'];
-		if (Array.isArray(dns['fake-ip-filter'])) {
-			const sanitized = [];
-			for (const item of dns['fake-ip-filter']) {
-				if (typeof item !== 'string') continue;
-				const parts = item.split(',').map(s => s.trim());
-				if (parts.length >= 3) {
-					const [type, val, action] = parts;
-					if (action.toLowerCase() === 'real-ip') {
-						if (type.toUpperCase() === 'DOMAIN-SUFFIX') {
-							sanitized.push(`+.${val}`);
-						} else if (type.toUpperCase() === 'DOMAIN-KEYWORD') {
-							sanitized.push(`*${val}*`);
-						} else if (type.toUpperCase() === 'DOMAIN') {
-							sanitized.push(val);
-						} else {
-							sanitized.push(val);
+	}
+	if (Array.isArray(dns['fake-ip-filter'])) {
+		const candidates = [];
+		for (const item of dns['fake-ip-filter']) {
+			if (typeof item !== 'string') continue;
+			const trimmed = item.trim();
+			const parts = trimmed.split(',').map(s => s.trim());
+			if (parts.length >= 3) {
+				const [type, val, action] = parts;
+				if (action.toLowerCase() === 'real-ip') {
+					if (type.toUpperCase() === 'DOMAIN-SUFFIX') {
+						candidates.push(`+.${val}`);
+					} else if (type.toUpperCase() === 'DOMAIN-KEYWORD') {
+						if (val.toLowerCase() === 'time') {
+							candidates.push('time.*.com', 'time.windows.com', 'time.apple.com');
+						} else if (val.toLowerCase() === 'ntp') {
+							candidates.push('+.pool.ntp.org', '*.ntp.org.cn');
 						}
+					} else if (type.toUpperCase() === 'DOMAIN') {
+						candidates.push(val);
 					}
-				} else if (parts.length === 2 && parts[0].toUpperCase() === 'MATCH') {
-					// skip MATCH,fake-ip as it's default in blacklist mode
-				} else {
-					sanitized.push(item);
 				}
+			} else if (parts.length === 2 && parts[0].toUpperCase() === 'MATCH') {
+				// skip MATCH,fake-ip as it's default in blacklist mode
+			} else {
+				candidates.push(trimmed);
 			}
-			dns['fake-ip-filter'] = sanitized;
 		}
+
+		const seen = new Set();
+		const sanitized = [];
+		for (const d of candidates) {
+			if (isValidMihomoFakeIpDomain(d) && !seen.has(d)) {
+				seen.add(d);
+				sanitized.push(d);
+			}
+		}
+		dns['fake-ip-filter'] = sanitized;
 	}
 }
 
