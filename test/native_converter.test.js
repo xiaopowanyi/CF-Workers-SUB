@@ -628,6 +628,11 @@ test('Rule relay endpoint (/rule) handles authorization, failover and edge cachi
     const resRuleCached = await worker.fetch(new Request(`https://mysub.workers.dev/mytesttoken/rule?url=${encodeURIComponent(directUrl)}`), mockEnv);
     assert.equal(resRuleCached.status, 200);
     assert.equal(resRuleCached.headers.get('X-Cache-Status'), 'HIT-MEMORY');
+
+    // 5. 强制刷新请求 (?flush=1 或 Cache-Control: no-cache) -> 穿透并刷新缓存 (REFRESHED)
+    const resRuleFlush = await worker.fetch(new Request(`https://mysub.workers.dev/mytesttoken/rule?url=${encodeURIComponent(directUrl)}&flush=1`), mockEnv);
+    assert.equal(resRuleFlush.status, 200);
+    assert.equal(resRuleFlush.headers.get('X-Cache-Status'), 'REFRESHED');
 });
 
 test('Web UI includes GHPROXY settings and persists to KV', async () => {

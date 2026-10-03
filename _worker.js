@@ -102,6 +102,11 @@ export default {
 			return await handleRuleProxyRequest(request, targetUrl, env);
 		}
 
+		if (url.searchParams.has('flush') || url.searchParams.has('refresh') || url.searchParams.has('nocache')) {
+			subConfigCache.clear();
+			overrideConfigCache.clear();
+		}
+
 		// 解析当前生效的 SUBCONFIG (优先级: URL参数 ?config= > KV 中保存的 CONFIG.txt > 环境变量 SUBCONFIG > 默认 subConfig)
 		let currentSubConfig = url.searchParams.get('config');
 		if (!currentSubConfig && env.KV) {
@@ -1257,31 +1262,55 @@ export async function handleRuleProxyRequest(request, targetUrl, env = {}) {
 
 	const now = Date.now();
 	const cacheId = `${targetFormat}:${cleanUrl}`;
-
-	// 1. 优先检查内存缓存
-	const memCached = ruleMemoryCache.get(cacheId);
-	if (memCached && (now - memCached.time < 86400000)) {
-		const headers = new Headers();
-		headers.set('Content-Type', targetFormat === 'text' ? 'text/plain; charset=utf-8' : 'text/yaml; charset=utf-8');
-		headers.set('Cache-Control', 'public, max-age=86400');
-		headers.set('Access-Control-Allow-Origin', '*');
-		headers.set('X-Cache-Status', 'HIT-MEMORY');
-		return new Response(memCached.text, { status: 200, headers });
-	}
-
-	// 2. Cloudflare Edge 边缘缓存 (caches.default)
 	const cacheKey = new Request(`${cleanUrl}${cleanUrl.includes('?') ? '&' : '?'}cf_fmt=${targetFormat}`, { method: 'GET' });
+
+	const reqCacheControl = (request.headers && request.headers.get('cache-control')) || '';
+	const reqPragma = (request.headers && request.headers.get('pragma')) || '';
+	const isForceRefresh = reqUrl.searchParams.has('flush') ||
+		reqUrl.searchParams.has('refresh') ||
+		reqUrl.searchParams.has('nocache') ||
+		reqCacheControl.includes('no-cache') ||
+		reqPragma.includes('no-cache');
+
 	let cache = null;
 	try {
 		if (typeof caches !== 'undefined' && caches.default) {
 			cache = caches.default;
-			const cachedResponse = await cache.match(cacheKey);
-			if (cachedResponse) {
-				return cachedResponse;
-			}
 		}
 	} catch (e) {
-		console.warn('Edge cache match error:', e);
+		console.warn('Edge cache init error:', e);
+	}
+
+	if (isForceRefresh) {
+		ruleMemoryCache.delete(cacheId);
+		if (cache) {
+			try {
+				await cache.delete(cacheKey);
+			} catch (_) {}
+		}
+	} else {
+		// 1. 优先检查内存缓存
+		const memCached = ruleMemoryCache.get(cacheId);
+		if (memCached && (now - memCached.time < 86400000)) {
+			const headers = new Headers();
+			headers.set('Content-Type', targetFormat === 'text' ? 'text/plain; charset=utf-8' : 'text/yaml; charset=utf-8');
+			headers.set('Cache-Control', 'public, max-age=86400');
+			headers.set('Access-Control-Allow-Origin', '*');
+			headers.set('X-Cache-Status', 'HIT-MEMORY');
+			return new Response(memCached.text, { status: 200, headers });
+		}
+
+		// 2. Cloudflare Edge 边缘缓存 (caches.default)
+		if (cache) {
+			try {
+				const cachedResponse = await cache.match(cacheKey);
+				if (cachedResponse) {
+					return cachedResponse;
+				}
+			} catch (e) {
+				console.warn('Edge cache match error:', e);
+			}
+		}
 	}
 
 	// 3. 多源容灾候选池依次遍历，单点镜像失效自动无缝回退
@@ -1290,7 +1319,10 @@ export async function handleRuleProxyRequest(request, targetUrl, env = {}) {
 		try {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 4000);
-			const resp = await fetch(cand, {
+			const fetchUrl = isForceRefresh
+				? `${cand}${cand.includes('?') ? '&' : '?'}_t=${now}`
+				: cand;
+			const resp = await fetch(fetchUrl, {
 				signal: controller.signal,
 				headers: getRequestHeadersForUrl(cand)
 			});
@@ -1312,7 +1344,7 @@ export async function handleRuleProxyRequest(request, targetUrl, env = {}) {
 					headers.set('Access-Control-Allow-Origin', '*');
 					headers.set('X-Relay-Source', cand);
 					headers.set('X-Rule-Format', targetFormat);
-					headers.set('X-Cache-Status', 'MISS');
+					headers.set('X-Cache-Status', isForceRefresh ? 'REFRESHED' : 'MISS');
 
 					const response = new Response(processedText, { status: 200, headers });
 					if (cache) {
