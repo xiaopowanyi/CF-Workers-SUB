@@ -234,7 +234,10 @@ export default {
 				? token
 				: (reqToken && [mytoken, fakeToken, 访客订阅].includes(reqToken) ? reqToken : mytoken);
 			const origin = (url.origin && url.origin !== 'null') ? url.origin : `https://${url.host}`;
-			const workerRuleBase = `${origin}/${effectiveToken}/rule`;
+			const isFlush = url.searchParams.has('flush') || url.searchParams.has('refresh') || url.searchParams.has('nocache');
+			const workerRuleBase = isFlush
+				? `${origin}/${effectiveToken}/rule?flush=1`
+				: `${origin}/${effectiveToken}/rule`;
 
 			// 根据当前选择或配置的 SUBCONFIG 解析规则与分组
 			const subConfigParsed = await loadSubConfig(currentSubConfig, currentGhProxy);
