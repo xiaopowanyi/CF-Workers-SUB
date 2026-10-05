@@ -1192,6 +1192,12 @@ export function cleanTextRuleList(rawText) {
 		if (!line || line.startsWith('#') || line.startsWith(';') || line.startsWith('//')) {
 			continue;
 		}
+		if (line.startsWith('-')) {
+			line = line.slice(1).trim();
+		}
+		if ((line.startsWith("'") && line.endsWith("'")) || (line.startsWith('"') && line.endsWith('"'))) {
+			line = line.slice(1, -1).trim();
+		}
 		const commentIdx = line.indexOf(' #');
 		if (commentIdx !== -1) {
 			line = line.slice(0, commentIdx).trim();
@@ -1463,17 +1469,17 @@ export async function loadSubConfig(url, ghProxy = 'worker') {
 }
 
 const REGION_PATTERNS = {
-	'香港': /港|hk|hongkong|hong kong/i,
-	'台湾': /台|tw|taiwan|新北|台北/i,
-	'新加坡': /新|sg|singapore|狮城/i,
-	'日本': /日|jp|japan|东京|大阪/i,
-	'美国': /美|us|united states|america/i,
-	'德国': /德|de|germany|法兰克福/i,
-	'英国': /英|uk|gb|britain|united kingdom|伦敦/i,
-	'韩国': /韩|kr|korea|首尔/i,
-	'加拿大': /加|ca|canada/i,
-	'澳大利亚': /澳|au|australia|悉尼/i,
-	'法国': /法|fr|france|巴黎/i,
+	'香港': /港|hk|hongkong|hong kong|🇭🇰/i,
+	'台湾': /台|tw|taiwan|新北|台北|台灣|🇹🇼/i,
+	'新加坡': /新|sg|singapore|狮城|🇸🇬/i,
+	'日本': /日|jp|japan|东京|大阪|埼玉|深日|沪日|🇯🇵/i,
+	'美国': /美|us|united states|america|硅谷|洛杉矶|纽约|波特兰|西雅图|达拉斯|圣何塞|🇺🇸/i,
+	'德国': /德|de|germany|法兰克福|柏林|🇩🇪/i,
+	'英国': /英|uk|gb|britain|united kingdom|伦敦|🇬🇧/i,
+	'韩国': /韩|kr|korea|kor|首尔|春川|🇰🇷/i,
+	'加拿大': /加|ca|canada|🇨🇦/i,
+	'澳大利亚': /澳|au|australia|悉尼|🇦🇺/i,
+	'法国': /法|fr|france|巴黎|🇫🇷/i,
 };
 
 function matchNodesByRegion(nodes, groupName) {
